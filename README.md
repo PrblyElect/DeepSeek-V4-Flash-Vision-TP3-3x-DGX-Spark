@@ -1,0 +1,398 @@
+---
+license: mit
+base_model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+library_name: vllm
+tags:
+- serving-recipe
+- vllm
+- dgx-spark
+- tensor-parallel
+- vision
+---
+
+# DeepSeek-V4-Flash Vision-Exp at TP=3 across 3× NVIDIA DGX Spark — with native vision
+
+**TL;DR** — Serve DeepSeek-V4-Flash-Vision-Exp (native weights, native
+ViT + Aligner vision, 8 images per request) tensor-parallel across three
+DGX Sparks (GB10) on a CX-7 RoCE triangle, with DSpark k=5 speculative
+decoding and a ported sequence-parallel prefill path. As far as we can
+find this is the **first TP=3 serving of this checkpoint with the vision
+tower live**. Warm numbers: **~99 tok/s** single-stream on code-class
+streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.1M-token
+KV pool ≈ 3.9 simultaneous full-1M-context sessions**, instructed-recall
+verified **word-exact to ~950K tokens**, 8/8 images per request at
+~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
+Boot is ~5 min with ~95 pre-warmed shapes and zero mid-serve JIT. The
+defaults leave **~4–9 GiB/box of headroom for co-tenant services** — that
+is part of the spec, not a leftover (**Headroom by design** below).
+
+Just as valuable as the profile is the **measurement methodology** this
+recipe standardizes — an instructed-recall needle rule, cold/warm and
+solo/mixed labeling, and a same-boot-only A/B discipline, each adopted
+after this campaign demonstrably fooled itself without it (see **The
+methodology** and `docs/FIXLOG.md`, which records the retractions).
+
+## What this is
+
+A serving profile for the Vision-Exp checkpoint — full native mixed
+FP4+FP8 weights (~170 GB), the checkpoint-local ViT + Aligner vision
+tower (user-message images only, 8 per request), and the trained DSpark
+draft module — at **TP=3** over three Sparks, made possible by:
+
+- the **attention-group pad 8→9 kit** ([localaiguyy](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark),
+  MIT — credited and linked): o_group count 8→9 with heads-per-group
+  constant, so TP=3 divides cleanly; and
+- a **runtime image with a working multimodal serving class** for this
+  model family (the pinned `dspark-vllm-gx10` image — most forks of this
+  line serve text-only); and
+- this repo's **SP-prefill applier** (`patches/`): a staged port of
+  community sequence-parallel prefill semantics onto this runtime's
+  V4.0-vision tree, plus the pad kit chaining.
+
+The serving config of record: DSpark k=5 · 32 seqs (capture 192) ·
+MNBT 8192 · long-prefill threshold 1024 (measured optimum) ·
+adaptive chunk ON (solo deep prefills run as full ~8K chunks — the SP
+engagement switch) · SP stage 3 · gmu 0.78 · 1M context. Every axis
+carries a measured verdict or a recorded blocker (`docs/FIXLOG.md`).
+
+The recipe is checkpoint-agnostic within the Vision-Exp family: serve
+the official release, or an abliteration derivative of it — our
+validation ran on one such derivative (a rank-1 refusal-direction
+projection build; pick your weights with your eyes open, and re-run the
+refusal/sanity probe on whichever you choose).
+
+## Quick start
+
+This repo ships the profile (env), the SP patch layer, the acceptance
+harness, and the measured why. Bring-up rides two public upstream repos:
+the pad kit above and the public 2-Spark DSpark vision recipe line that
+provides the compose/launcher machinery.
+
+1. Stage the checkpoint on **all three** boxes (identical path):
+```sh
+hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --revision 86f746b36186f0e567729a5c06a8c918caba82a9 \
+  --local-dir /home/YOURUSER/models/deepseek-v4-flash-vision-exp
+# (serving an abliteration derivative instead? stage that repo/revision and
+#  keep any runtime-abliteration flag at 0 — the weights are already ablated)
+```
+2. Stage the upstream vision-recipe checkout on all three boxes and the
+   pad kit into its patch dir; drop this repo's `patches/` beside it and
+   chain the SP applier after the pad kit (`patches/README.md` — the
+   `__main__` stanza IS the execution order).
+3. Stage `config/cluster.env` as the checkout's env file; edit the
+   `EDIT` blocks (hosts, checkpoint paths).
+4. Workers first, then head. The ring serves `:8000` in ~5 min; the
+   boot log must show the NCCL 3-rank banner, the pad lines, and the SP
+   stage-3 line before anything else is diagnosed.
+5. Run the gates (`docs/VALIDATION.md` has the full battery):
+```sh
+python3 tools/needle-probe.py --selftest
+python3 tools/needle-probe.py --depths 131072,262144,419430 --nonce fresh1   # instructed ladder
+bash   tools/boot-shape-warmup.sh http://spark-head:8000 ds4flash-vision
+python3 tools/agg-sweep.py --levels 1,4,16,32
+BATTERY_LANE=http://spark-head:8000 BATTERY_RERANK=... BATTERY_EMBED=... python3 tools/mixed-battery.py
+```
+
+Validated over a three-day bring-up + tuning campaign; every headline
+number below was measured on this hardware and this image, under the
+labeling discipline of `docs/VALIDATION.md`.
+
+## The numbers (measured, labeled, rounded)
+
+| Metric | Value |
+|---|---|
+| Solo deep prefill | **~1.5K tok/s @ ~420K context** (warm; cold-first pays ~1.6× JIT; ±10% per-boot — see lottery below) · ~1.6K @ ~320K · ~1.8K @ ~210K · ~3.2K shallow |
+| Mixed-serving deep prefill | ~1.3K tok/s at the same depth (a structural **~20% mixed tax** — prefill is the serial resource; both alternatives measured worse) |
+| Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound: ~9/10 tokens accepted/drafted at k=5) |
+| Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
+| KV pool | **~4.1M tokens ≈ 3.9 full-1M sessions** at gmu 0.78 (boot jitter ±10%; the pool is the min across ranks) |
+| Long-context recall | instructed needle **word-exact to ~950K tokens** (~1K tok/s prefill at that depth); 1M is configured and pool-proven |
+| Vision | **8/8 images per request, in order**, at TP=3 · **~0.7 s image-TTFT** · multi-image color/position correct |
+| Warm-prefix replay | **~14× effective TTFT** (a stable ~24K prefix replays at ~2 s wall vs a cold effective rate ~14× slower) |
+| Cold boot to serving | **~5 min**, ~95 warmup shapes, **zero mid-serve JIT** (C=1…16 + sampler combos pre-compiled) |
+| Output integrity | temp-0 exact repeats byte-identical (incl. through the SP collectives); strict JSON clean; mixed battery 0 errors |
+| Host headroom | **~4–9 GiB/box** steady at gmu 0.78 (settled floor ~2.4 GiB on the most-shared box); see below |
+
+### Headroom by design — the profile shares the boxes
+
+This is a working-stack recipe, not a whole-box benchmark. The shipped
+defaults sit deliberately below the measured ceilings so the same three
+Sparks keep carrying the rest of a live stack — rerankers, embedders,
+document processing, chat frontends. At the shipped gmu the boxes hold
+~4–9 GiB steady with the lane serving, a several-GiB floor holds through
+a mixed battery with the co-tenant services **live** (the acceptance
+gate's full form runs them in flight — a tenants-skipped run is a
+diagnostic, not a gate), and the measured reason 0.80 is not shipped is
+exactly this: it left ~1 GiB on the most-shared box, which is an
+OOM-under-tenant-burst waiting to fire. Spend the headroom deliberately;
+every gmu step in the FIXLOG records what it buys.
+
+## The methodology (this recipe's other product)
+
+Seven rules, each adopted after this campaign fooled itself without it.
+Steal them for any long-context serving work:
+
+1. **Instructed recall needles — the community warning.** An
+   instruction-less needle (filler + "NOTE: the magic word is X.", no
+   question) measures the model's temperature-0 **continuation style**,
+   not recall: greedy decoding sits on a near-tie between echoing the
+   filler and reciting the word, and the nonce and kernel/cache
+   numerics decide which wins. We measured uninstructed misses at depth
+   coexisting with 6/6 instructed passes on the same boot — after days
+   chasing the phantom "corruption boundary" those misses painted
+   (thermal hypotheses, power cycles, allocation shifts; FIXLOG rungs
+   22–23). Always append an explicit instruction; score word-exact.
+2. **Cold/warm JIT labeling.** The first deep exercise of a fresh boot
+   compiles deep-context kernel specializations: ~1.6× slower at ~420K,
+   worse deeper. An unlabeled first-run number is a boot property, not
+   throughput. (Seven single-needle boots once read as a "2× deep-prefill
+   regression" — it was seven cold reads.)
+3. **Solo/mixed labeling.** A deep prefill measured solo and the same
+   depth measured mid-battery differ by a structural ~20% here, and
+   interactive streams fall to a few tok/s while a deep prefill runs.
+   Publish the label with the number.
+4. **Per-boot kernel-tactic lottery — same-boot A/B only.** Identical
+   config spreads ±10% across boots, non-overlapping, with the
+   persistent autotune cache proven byte-frozen across the spreading
+   boots: the residual is environmental boot state, not tactic
+   selection (so "pin the tactics" pins nothing — FIXLOG). Cross-boot
+   deltas under ~13% are noise on this stack.
+5. **Mixed battery acceptance.** Healthy = interactive streams + chat +
+   image requests + co-tenant services all in flight at once, memory
+   sampled throughout — not single-class probes in isolation.
+6. **Harness self-test.** Offline corpus assertions + a live micro-
+   needle before every session (`needle-probe.py --selftest`). Both
+   harness bugs this history records shipped before it existed.
+7. **Advisory boot-lottery check.** One standard needle per fresh boot,
+   logged; a far-below-band draw earns a "consider a restart window"
+   note — advisory only, because every boot wipes the prefix cache
+   (never auto-restart a serving lane).
+
+`docs/VALIDATION.md` turns these into the gate battery; `docs/FIXLOG.md`
+records what each rule cost to learn.
+
+## Variants (each is one env flip)
+
+- **Long-document**: MNBT 6144 + the image's sparse-MLA chunk hotfix →
+  **~3.9M pool** at ~−14% aggregate — for deep-research days when the
+  fourth full-1M session matters more than throughput. The hotfix is
+  load-bearing at 6144 (deep recall fails without it on this stack).
+- **seqs 16** (capture 96): lighter capture bill, ~720 @ 16-way — the
+  interactive-friendlier shape if you never reach 32 streams.
+- **Max-pool batch**: MNBT 4096, no-spec-style usage → the biggest pool
+  at ~−70% single-stream (the spec pipeline starves; measured both
+  ways). Know why you're choosing it.
+- **Stage-4 indexer row split** (`--stages 4`): correctness-clean
+  (every instructed gate + vision + drift-aware split-check pass), a
+  small pool side-win, **no measured speed case on this stack** —
+  documented variant, kept in-tree for the eventual upstream-fixed
+  runtime. The `--stages 3` apply emits zero stage-4 bytes.
+
+## Working with long contexts
+
+- **TTFT expectations**: ~25K cold ≈ 15 s, ~60K ≈ 35 s at the solo rate;
+  the *first* deep prefill after boot pays the JIT premium (pre-warm or
+  label). Warm-prefix replay is the felt-speed lever: keep client system
+  prompts and repo context stable — a replayed ~24K prefix answers ~14×
+  faster (effective rate). After any boot, replay your clients' prefixes
+  before judging speed, and never restart the lane casually: the boot
+  wipes the prefix cache for every client at once.
+- **Exercise your real depth before trusting it.** Recall here is
+  verified to ~950K (instructed, word-exact); the pool math holds ~3.9
+  full windows. If you serve near the envelope, run the ~950K probe
+  yourself — it is one command and ~15 min.
+- **Thinking mode** defaults high on this family's reasoning parser:
+  budget `reasoning_content` inside `max_tokens`, or send
+  `chat_template_kwargs: {"thinking": false}` for latency-bound loops.
+- **Concurrency**: interactive streams sit in the ~99 tok/s class at low
+  concurrency; aggregate climbs to ~1K at the 32-way cap (per-stream
+  ~30 — batch class, not interactive).
+
+## vs. other published lanes — honest scoreboard
+
+- **The pad kit's own text-only 3-Spark recipe** ([localaiguyy,
+  above](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark)):
+  ~620 tok/s @ 32-way on the text checkpoint. This lane: **~1K @ 32 with
+  native vision and a verified 1M window** (channels/seqs/caches ladder
+  — FIXLOG), on top of the same pad geometry.
+- **Best published 2-Spark Vision-Exp lane** ([tonyd2wild's
+  DSpark/NVFP4-KV
+  recipe](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)):
+  ~84 tok/s peak single-stream, ~182 @ 6-way, 2.79M pool, TTFT 4.1 s
+  @8K → 29.5 s @100K. This lane: faster single-stream (~99 vs ~84),
+  ~4× the concurrent-stream ceiling, ~1.5× the pool — for 1.5× the boxes.
+- **V4.1 native TP=3 reference** ([christopher_owen's
+  thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438)):
+  ~65–78 single-stream, 171–196 @ 8-way, prefill flat ~3.8K tok/s — his
+  SP-prefill patches + driver-level memory work ride the V4.1
+  checkpoint's cheaper prefill architecture. This recipe ports the SP
+  concepts onto the V4.0-vision tree and measures what survives: the
+  prefill gap (~1.5K vs ~3.8K) is checkpoint generation, not a flag.
+- A companion text-only V4-Flash TP=3 recipe from the same authors
+  carries the text-lane details (CSF packing, profile split) this
+  checkpoint doesn't need.
+
+Net: three boxes buy **native vision at TP=3 with 32-way aggregate
+headroom, ~3.9 full-1M sessions, and verified ~950K recall**. Prefill
+remains the frontier — nobody's 3-box V4.0 prefill matches the best
+patched V4.1 lanes, and neither does ours.
+
+## Hardware / network this was proven on
+
+- 3× DGX Spark (GB10, sm_121, ~122 GiB usable **unified** memory each —
+  CPU, containers, and page cache all draw from the same pool the engine
+  profiles)
+- Full CX-7 triangle: three QSFP cables, one /24 per leg, RoCEv2, GID
+  index 3, MTU 9000; management LAN for bootstrap; NCCL pinned to both
+  on-board HCAs per rank, cross-NIC
+- 8 NCCL channels (the measured 3-rank interior optimum)
+
+## Stack (pinned)
+
+| Component | Pin |
+|---|---|
+| Runtime image | `ghcr.io/anemll/dspark-vllm-gx10` @ `sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8` (the v0.1.1 release line — the only public image of this line with a working multimodal class for this family; re-pin ⇒ re-validate the patches) |
+| Checkpoint | any Vision-Exp packaging; validated with the official repo @ `86f746b36186` (and an abliteration derivative of it — see above) |
+| TP=3 pad | the localaiguyy kit (MIT), applied by the checkout at `TP_SIZE=3` |
+| SP prefill | this repo's `patches/apply_sp_prefill.py`, stage 3, chained after the pad kit |
+| Spec decode | DSpark k=5 probabilistic (trained in-checkpoint drafter) |
+| KV | image-default `nvfp4_ds_mla` (fp8 measured and rejected — rung 10) |
+
+## The landmines (read before booting)
+
+Full detail per rung in `docs/FIXLOG.md`.
+
+1. **The pad mechanism is group-count 8→9, heads-per-group stays 8.**
+   The kit's own docs contradict each other; the applier's code is
+   authoritative (r stays 8×512 = 4096 — the fp8 einsum kernel contract).
+   Read the code that runs.
+2. **Pad-group attention sinks are −inf, never zero.** A zeroed sink adds
+   a phantom softmax denominator term that attenuates the real heads:
+   grammatical, confident, WRONG output. Silent corruption, not a crash.
+3. **Don't import another family's pad-backend env path** — this model
+   rejects that backend — and never route the sink through a zero-fill
+   helper.
+4. **Unified memory means the startup check wants gmu × ~122 GiB FREE per
+   rank**: co-tenants and dirty page cache count against it. Drop caches
+   on every rank pre-boot; set gmu by the most-shared box. The pool is
+   the min across ranks — per-rank gmu forks mathematically cannot raise
+   it.
+5. **`MAX_NUM_BATCHED_TOKENS` is profile-specific**: 4096 starves spec
+   decode (~−70% single-stream); 6144 breaks deep recall without the
+   sparse-MLA chunk hotfix; 16384 burns ~40% of the pool for nothing.
+   Spec boots keep 8192.
+6. **Capture size = seqs × (k+1)** — 192 at the shipped shape.
+7. **k is not a dial**: the trained block is exactly 5 (k=6 collapses
+   acceptance; k<5 truncates the block). Measured from both sides.
+8. **Verify env vars actually landed in the container** before reading a
+   null result — a silent compose passthrough miss reads exactly like
+   "the knob doesn't help" (it did, ~+20%, once it actually applied).
+9. **Thinking defaults ON/high** — see the long-context section, or your
+   first low-`max_tokens` request looks "broken".
+10. **Label cold runs**: the first deep prefill of a boot pays ~1.6× JIT,
+    growing with depth. Pre-warm it or label it; never report it as
+    throughput.
+11. **±10% per-boot lottery**: same-boot A/B only; cross-boot deltas
+    under ~13% are noise here. The advisory per-boot needle check
+    catches a bad draw.
+12. **A boot wipes the prefix cache** for every client at once — replay
+    prefixes after every boot; never restart a serving lane casually.
+13. **Never gate recall on an instruction-less needle** (the methodology
+    section; this single rule cost days).
+14. **SP engagement is chunk-shape-gated**: below MIN_ROWS (4097) rows
+    everything is stock — mixed serving runs stock **by design**; solo
+    deep prefills engage SP only as full ~8K chunks (adaptive chunk ON).
+    The engine's stage/split log lines are the engagement proof; the
+    mixed-axis alternatives were measured and rejected.
+15. **gmu 0.80 is rejected on this stack** (measured ~1 GiB floor on the
+    most-shared box) — don't copy it across tenancies.
+16. **Boot hygiene**: workers first, head last; fresh `docker run` never
+    `restart`; one GPU owner per box; drop caches every rank; a NIC
+    stuck slow or a GPU latched below clock is fixed by a cold power
+    drain, not a warm reboot.
+17. **Probe hygiene**: never probe a box's GPU from inside the engine
+    container during a gate; read `usage.prompt_tokens` (filler token
+    estimates run ~1.6× low); never compare prefill across filler
+    classes (repetitive haystacks read 2–3× fast).
+
+## Repo layout
+
+- `config/cluster.env` — the serving profile of record (every pin +
+  the measured-why comment)
+- `patches/apply_sp_prefill.py` — the staged SP-prefill applier
+  (marker-guarded, idempotent, fail-closed, `--check`/`--revert`)
+- `patches/README.md` — stage semantics, chaining, engineering
+  constraints, credits
+- `tools/needle-probe.py` — the instructed-recall ladder + vision fence
+  + self-test (the correctness instrument)
+- `tools/agg-sweep.py` — aggregate sweep with the workload split +
+  corruption spot-check
+- `tools/mixed-battery.py` — the mixed-surface acceptance battery
+  (interactive + chat + vision + co-tenant legs, memory floor)
+- `tools/boot-shape-warmup.sh` — boot-time shape/JIT warmup
+  (~95 shapes, tokenize-gated ladder, sampler-combo postcondition)
+- `docs/FIXLOG.md` — 29 rungs, four ladders, including the retractions
+- `docs/VALIDATION.md` — the measurement methodology + gate battery
+- `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
+
+## What's next (roadmap, not needed for correctness)
+
+- **Prefill** stays the frontier and is checkpoint-bound: every shipped
+  dial on this image measured into one ~1.5K-class band; the 2×-class
+  unlocks are the V4.1 generation's cheaper prefill architecture, not a
+  patch onto V4.0.
+- **Stage-4 indexer split** — correctness-clean, no speed case here;
+  reopens only with an upstream change or a comm-bound workload class.
+- **Kernel-tactic pinning** — open but narrowed: the autotune cache was
+  proven frozen across the ±10% spreading boots, so classic pinning
+  pins nothing; the true lever (environmental boot state) is unpinned.
+- **Upstream watch**: the pinned image line (v0.1.1 era) — the digest
+  pin plus the applier's fail-closed anchors make any drift loud;
+  re-pin deliberately.
+- **Multi-hour soak**: community reports on this image family include
+  garble-class issues under sustained spec-decode load; our batteries
+  and shorter soaks are clean, sustained windows are unproven — run one
+  before trusting any lane of this class unattended.
+- **CSF/compressed-scales packing** of this checkpoint when a public
+  CSF-capable runtime ships (the companion text-only recipe line
+  carries the toolchain pattern).
+
+## Not tested / not claimed
+
+Contexts beyond ~950K exercised (1M is configured and pool-proven);
+multi-hour sustained soaks; TP sizes other than 3; re-quants of the
+checkpoint; the official-vs-derivative refusal delta on any build but
+the one we probed (re-run the refusal/sanity probe on your weights);
+non-English OCR-class vision workloads beyond the synthetic color
+fences.
+
+## Credits & prior art
+
+- **localaiguyy** — [the attention-group pad kit](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark)
+  (MIT): the 8→9 pad geometry this lane stands on, the capture =
+  seqs × (k+1) rule, and the zeroed-sink landmine class.
+- **Anemll** — the `dspark-vllm-gx10` runtime: the DSpark spec-decode
+  stack and the working multimodal serving class that makes vision at
+  TP>1 possible at all.
+- **MiaAI-Lab** — the public 2-Spark DSpark vision recipe line whose
+  env shape and boot machinery (including the warmup script this repo's
+  `tools/boot-shape-warmup.sh` adapts, with C=8/16 arms added) this
+  profile descends from, and the DS4-on-Spark bug documentation.
+- **tonyd2wild** — the [2-Spark Vision-Exp DSpark/NVFP4-KV
+  recipe](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)
+  we benchmark against.
+- **christopher_owen** — the [V4.1 TP=3 reference
+  thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438):
+  the prefill-SP patch-series semantics this applier adapts, and the
+  3-Spark numbers we race.
+- The companion text-only V4-Flash TP=3 recipe (same authors) — carried
+  rules: the MNBT two-truths, the capture cliff, the boot-hygiene set.
+
+Ours: the vision-at-TP=3 composition itself; the SP-prefill port onto
+the V4.0-vision tree (stages 1–3, the documented stage-4 variant, and
+the plain-ints/aux-stream engineering constraints); the instructed-recall
+instrument and the re-adjudication methodology; the cold/warm,
+solo/mixed, and same-boot labeling rules; the mixed battery with live
+co-tenants; the boot-lottery advisory check; the measured landmine
+ledger. Scripts: MIT (see `LICENSE`); upstream licenses apply.
