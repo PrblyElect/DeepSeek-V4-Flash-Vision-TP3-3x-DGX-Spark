@@ -45,6 +45,17 @@ under `tools/`, stdlib-only):
 - **One sacrificial deep prefill after health** — the first deep run of
   a boot pays ~1.6× in JIT (growing with depth). It must never land
   inside a measurement; label any number taken before the plateau `cold`.
+- **Idle-gate every solo/tier/speed measurement**: GET `/metrics` on the
+  engine and require `vllm:num_requests_running` == 0 **and**
+  `vllm:num_requests_waiting` == 0, immediately before measuring. Any
+  "slow" reading taken with traffic in flight — your own warmup
+  replays, scheduled jobs, co-tenant requests, other clients — is an
+  unlabeled MIXED number, not a boot property: don't act on it,
+  re-measure idle. The trap: post-boot warmup/replay traffic (a
+  ~4-minute automated prefix-replay class starting on the first
+  scheduler tick after boot) overlaps exactly the window where a fresh
+  boot first gets probed — let warm traffic settle or verify idleness
+  before believing any first-look number.
 - **Quote the engine's own pool** (the boot log's KV-size line), never an
   estimate; band it ±10% — the pool is boot-labile.
 
@@ -55,6 +66,17 @@ memory: page cache competes with the pool). Fresh `docker run` every
 boot. Run the boot shape-warmup (`tools/boot-shape-warmup.sh`) so no
 client eats a mid-serve JIT. No background transfers during the window.
 
+`/health` green proves only the API process, not the engine loop — a
+fresh-boot memory trough can let the kernel OOM-kill one TP worker
+during weight load while the endpoint keeps answering 200. After health
+turns green, prove ALL ranks are alive with one tiny completion request
+before any prefill-class traffic (wedge signature if you skipped this:
+survivor GPUs pinned near-full utilization at single-digit-to-low
+watts, engine log repeating a shared-memory broadcast timeout roughly
+every minute). And never give the containers an auto-restart policy: a
+killed rank under one becomes a crash loop re-applying boot patches on
+a reused filesystem — force-remove and relaunch fresh instead.
+
 ## 4. Label everything: cold/warm, solo/mixed, same-boot
 
 - **Cold vs warm**: the first deep exercise of a boot compiles
@@ -63,8 +85,9 @@ client eats a mid-serve JIT. No background transfers during the window.
 - **Solo vs mixed**: prefill under concurrent decode is the serial
   resource — a deep prefill measured solo reads ~1.5K tok/s on this
   stack, the same depth measured mid-battery ~1.3K (a structural ~20%
-  mixed tax; interactive streams drop to a few tok/s while a deep
-  prefill runs). Publish the label with the number.
+  mixed tax; without the deferral patch, interactive streams drop to a
+  few tok/s while a deep prefill runs — with it, ~3× inflation and
+  worst gaps in the ~1 s class). Publish the label with the number.
 - **Same-boot A/B only**: identical config spreads ±10% across boots
   (environmental boot state — the kernel autotune cache was proven
   byte-frozen across spreading boots). Within-boot comparisons are
@@ -73,7 +96,10 @@ client eats a mid-serve JIT. No background transfers during the window.
   prefix warm-up), fire one standard instructed needle and log the draw.
   A draw far below the band earns a "consider a restart window" note —
   advisory only; never auto-restart a serving lane (every boot wipes the
-  prefix cache).
+  prefix cache). The check is only meaningful idle-verified (§2): a
+  far-below-band reading taken with traffic in flight is contamination,
+  not a bad draw, and a contaminated draw must not trigger a restart
+  consideration.
 
 ## 5. The acceptance gate is a mixed battery
 
@@ -89,7 +115,8 @@ not a gate.
 
 ## 6. The gate battery (what "accepted" means here)
 
-In order, on the serving boot:
+In order, on the serving boot (every solo step runs only after the
+idle-gate in §2 passes):
 
 1. `needle-probe.py --selftest` — harness integrity.
 2. **Instructed needle ladder** at ~210K / ~320K / ~420K (word-exact,
@@ -99,8 +126,14 @@ In order, on the serving boot:
    cap — all eight left-colors named in order at TP=3.
 4. **Aggregate sweep** (`agg-sweep.py`) at 1/4/16/32 in both prompt
    classes, corruption spot-check green after.
-5. **Mixed battery** with the interactive floor (above).
-6. **Warm-prefix replay**: one stable ~24K prefix, cold call vs
+5. **Mixed-tax probe** (`mixed-tax-probe.py`, idle-gated, on the head
+   node): decode beside a ~440K fresh-nonce prefill — expect ~3× mean
+   inflation, worst gaps in the ~1 s class, median ≈ solo (a ~12× mean
+   with multi-second gaps means the deferral knob is off or was not
+   applied; check `DSPARK_PREFILL_DECODE_INTERVAL` and the patch's
+   `--status` inside the container).
+6. **Mixed battery** with the interactive floor (above).
+7. **Warm-prefix replay**: one stable ~24K prefix, cold call vs
    second-call TTFT — the replay win on this stack is ~14× effective.
 
 ## 7. Record as you go
