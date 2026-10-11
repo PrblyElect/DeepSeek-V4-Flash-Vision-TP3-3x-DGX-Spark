@@ -28,9 +28,10 @@ is part of the spec, not a leftover (**Headroom by design** below).
 
 Just as valuable as the profile is the **measurement methodology** this
 recipe standardizes — an instructed-recall needle rule, cold/warm and
-solo/mixed labeling, and a same-boot-only A/B discipline, each adopted
-after this campaign demonstrably fooled itself without it (see **The
-methodology** and `docs/FIXLOG.md`, which records the retractions).
+solo/mixed labeling, a same-boot-only A/B discipline, and an idle-gate
+on every solo measurement, each adopted after this campaign
+demonstrably fooled itself without it (see **The methodology** and
+`docs/FIXLOG.md`, which records the retractions).
 
 ## What this is
 
@@ -52,8 +53,10 @@ draft module — at **TP=3** over three Sparks, made possible by:
 The serving config of record: DSpark k=5 · 32 seqs (capture 192) ·
 MNBT 8192 · long-prefill threshold 1024 (measured optimum) ·
 adaptive chunk ON (solo deep prefills run as full ~8K chunks — the SP
-engagement switch) · SP stage 3 · gmu 0.78 · 1M context. Every axis
-carries a measured verdict or a recorded blocker (`docs/FIXLOG.md`).
+engagement switch) · **prefill-decode deferral cadence N=2** (decode
+fairness beside deep prefills — see below) · SP stage 3 · gmu 0.78 ·
+1M context. Every axis carries a measured verdict or a recorded
+blocker (`docs/FIXLOG.md`).
 
 The recipe is checkpoint-agnostic within the Vision-Exp family: serve
 the official release, or an abliteration derivative of it — our
@@ -91,7 +94,7 @@ python3 tools/needle-probe.py --selftest
 python3 tools/needle-probe.py --depths 131072,262144,419430 --nonce fresh1   # instructed ladder
 bash   tools/boot-shape-warmup.sh http://spark-head:8000 ds4flash-vision
 python3 tools/agg-sweep.py --levels 1,4,16,32
-BATTERY_LANE=http://spark-head:8000 BATTERY_RERANK=... BATTERY_EMBED=... python3 tools/mixed-battery.py
+BATTERY_LANE=http://127.0.0.1:8000 BATTERY_RERANK=... BATTERY_EMBED=... python3 tools/mixed-battery.py
 ```
 
 Validated over a three-day bring-up + tuning campaign; every headline
@@ -104,6 +107,7 @@ labeling discipline of `docs/VALIDATION.md`.
 |---|---|
 | Solo deep prefill | **~1.5K tok/s @ ~420K context** (warm; cold-first pays ~1.6× JIT; ±10% per-boot — see lottery below) · ~1.6K @ ~320K · ~1.8K @ ~210K · ~3.2K shallow |
 | Mixed-serving deep prefill | ~1.3K tok/s at the same depth (a structural **~20% mixed tax** — prefill is the serial resource; both alternatives measured worse) |
+| Decode beside a deep prefill | **~3× TPOT inflation, worst gaps in the ~1 s class, median ≈ solo speed** (deferral cadence ON; 4-stream ~2×/stream) — was **~12× with multi-second freezes** before it; mixed prefill itself improves (~14% → ~7–9% under solo) |
 | Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound: ~9/10 tokens accepted/drafted at k=5) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
 | KV pool | **~4.1M tokens ≈ 3.9 full-1M sessions** at gmu 0.78 (boot jitter ±10%; the pool is the min across ranks) |
@@ -128,9 +132,32 @@ exactly this: it left ~1 GiB on the most-shared box, which is an
 OOM-under-tenant-burst waiting to fire. Spend the headroom deliberately;
 every gmu step in the FIXLOG records what it buys.
 
+### Decode fairness during deep prefills
+
+The one mixed-load axis a chunk threshold alone cannot buy: an
+interactive stream that happens to run while a client uploads a deep
+(~400K-token-class) context. The scheduler's adaptive chunk lift
+decides "no decode active right now → one full-size chunk", and that
+presence check races with momentary decode absence (async scheduling,
+spec-decode draft phases) — plus every chunk-carrying step costs its
+full wall time even with decode co-batched. Felt effect before the
+fix: the stream freezes for multiple seconds at a time mid-prefill.
+
+`patches/apply_prefill_decode_interval.py` gates both on a
+recent-decode window and forces decode-favorable steps between chunks
+(`DSPARK_PREFILL_DECODE_INTERVAL=2`, one env flip to disable; 0/unset =
+the patch is not even applied). Measured same-night both arms,
+idle-gated: inflation ~12× → ~3×, worst gaps multi-second → ~1 s
+class, median gap back at solo speed, mixed prefill ~5 points *faster*
+— and outputs stay byte-identical. `tools/mixed-tax-probe.py` is the
+instrument; the engine-agnostic tell for the underlying race is a
+worst decode gap that matches your full-chunk quantum
+(`max_chunk_tokens / prefill_rate`) instead of your configured
+threshold.
+
 ## The methodology (this recipe's other product)
 
-Seven rules, each adopted after this campaign fooled itself without it.
+Eight rules, each adopted after this campaign fooled itself without it.
 Steal them for any long-context serving work:
 
 1. **Instructed recall needles — the community warning.** An
@@ -150,8 +177,8 @@ Steal them for any long-context serving work:
    regression" — it was seven cold reads.)
 3. **Solo/mixed labeling.** A deep prefill measured solo and the same
    depth measured mid-battery differ by a structural ~20% here, and
-   interactive streams fall to a few tok/s while a deep prefill runs.
-   Publish the label with the number.
+   (before the deferral patch) interactive streams fall to a few tok/s
+   while a deep prefill runs. Publish the label with the number.
 4. **Per-boot kernel-tactic lottery — same-boot A/B only.** Identical
    config spreads ±10% across boots, non-overlapping, with the
    persistent autotune cache proven byte-frozen across the spreading
@@ -167,7 +194,21 @@ Steal them for any long-context serving work:
 7. **Advisory boot-lottery check.** One standard needle per fresh boot,
    logged; a far-below-band draw earns a "consider a restart window"
    note — advisory only, because every boot wipes the prefix cache
-   (never auto-restart a serving lane).
+   (never auto-restart a serving lane). Only meaningful idle-verified
+   (rule 8): a far-below-band reading taken with traffic in flight is
+   contamination, not a bad draw — a contaminated draw must not trigger
+   a restart consideration.
+8. **Idle-gate every solo measurement.** Before ANY solo/tier/speed
+   reading, GET `/metrics` on the engine and require
+   `vllm:num_requests_running` == 0 **and** `vllm:num_requests_waiting`
+   == 0, immediately before measuring. A "slow" reading taken with any
+   traffic in flight — your own warmup replays, scheduled jobs,
+   co-tenant requests, other clients — is an unlabeled MIXED number,
+   not a boot property: don't act on it, re-measure idle. The trap:
+   post-boot warmup/replay traffic overlaps exactly the window where a
+   fresh boot first gets probed — let warm traffic settle or verify
+   idleness before believing any first-look number. (A day was lost to
+   a phantom "slow tier" that was exactly this; FIXLOG.)
 
 `docs/VALIDATION.md` turns these into the gate battery; `docs/FIXLOG.md`
 records what each rule cost to learn.
@@ -247,6 +288,10 @@ patched V4.1 lanes, and neither does ours.
   index 3, MTU 9000; management LAN for bootstrap; NCCL pinned to both
   on-board HCAs per rank, cross-NIC
 - 8 NCCL channels (the measured 3-rank interior optimum)
+- One fabric address per HCA port, always — a duplicate /24 left on two
+  ports by a stale profile is a per-boot routing lottery that reads
+  clean at the link layer; after any fabric change, audit every box
+  with `ip -br addr`
 
 ## Stack (pinned)
 
@@ -256,6 +301,7 @@ patched V4.1 lanes, and neither does ours.
 | Checkpoint | any Vision-Exp packaging; validated with the official repo @ `86f746b36186` (and an abliteration derivative of it — see above) |
 | TP=3 pad | the localaiguyy kit (MIT), applied by the checkout at `TP_SIZE=3` |
 | SP prefill | this repo's `patches/apply_sp_prefill.py`, stage 3, chained after the pad kit |
+| Decode fairness | this repo's `patches/apply_prefill_decode_interval.py` at N=2 (`DSPARK_PREFILL_DECODE_INTERVAL`; 0/unset = not applied) |
 | Spec decode | DSpark k=5 probabilistic (trained in-checkpoint drafter) |
 | KV | image-default `nvfp4_ds_mla` (fp8 measured and rejected — rung 10) |
 
@@ -295,7 +341,8 @@ Full detail per rung in `docs/FIXLOG.md`.
     throughput.
 11. **±10% per-boot lottery**: same-boot A/B only; cross-boot deltas
     under ~13% are noise here. The advisory per-boot needle check
-    catches a bad draw.
+    catches a bad draw — but only when the engine is idle when checked
+    (see 18).
 12. **A boot wipes the prefix cache** for every client at once — replay
     prefixes after every boot; never restart a serving lane casually.
 13. **Never gate recall on an instruction-less needle** (the methodology
@@ -315,6 +362,34 @@ Full detail per rung in `docs/FIXLOG.md`.
     container during a gate; read `usage.prompt_tokens` (filler token
     estimates run ~1.6× low); never compare prefill across filler
     classes (repetitive haystacks read 2–3× fast).
+18. **Idle-gate solo measurements**: before ANY solo/tier/speed reading,
+    GET `/metrics` and require `vllm:num_requests_running` == 0 and
+    `vllm:num_requests_waiting` == 0, immediately before measuring. A
+    "slow" reading taken with traffic in flight — your own warmup
+    replays, scheduled jobs, co-tenant requests, other clients — is an
+    unlabeled mixed number, never a boot property: don't act on it,
+    re-measure idle. Post-boot warmup/replay traffic overlaps exactly
+    the window where a fresh boot first gets probed; let it settle or
+    verify idleness.
+19. **A dead rank still serves `/health` 200** — the health endpoint
+    proves the API process, not the engine loop. Wedge signature:
+    survivor GPUs pinned near-full utilization at single-digit-to-low
+    watts at full clocks, and the engine log repeating a shared-memory
+    broadcast timeout roughly every minute. Fresh-boot memory troughs
+    can let the kernel OOM-kill one TP worker during weight load: verify
+    per-rank headroom before boot, and after health turns green prove
+    ALL ranks are alive with one tiny completion request before any
+    prefill-class traffic. One killed rank + a container auto-restart
+    policy = a crash loop (each restart re-applies boot patches on a
+    reused filesystem, and patch kits are not guaranteed idempotent
+    under that) — force-remove the containers and launch fresh, never
+    just restart.
+20. **Exactly one fabric address per HCA port**: a stale profile that
+    leaves the same /24 on two ports makes each boot pick the route
+    between them nondeterministically — a per-boot performance lottery
+    that looks clean at the link layer (link state, error counters,
+    bandwidth tests all green). After any fabric change, audit every
+    box with `ip -br addr`.
 
 ## Repo layout
 
@@ -322,17 +397,22 @@ Full detail per rung in `docs/FIXLOG.md`.
   the measured-why comment)
 - `patches/apply_sp_prefill.py` — the staged SP-prefill applier
   (marker-guarded, idempotent, fail-closed, `--check`/`--revert`)
+- `patches/apply_prefill_decode_interval.py` — the decode-fairness
+  deferral-cadence applier (env-gated, idempotent, anchor-enforced
+  ordering after adaptive-chunk + issue-43)
 - `patches/README.md` — stage semantics, chaining, engineering
   constraints, credits
 - `tools/needle-probe.py` — the instructed-recall ladder + vision fence
   + self-test (the correctness instrument)
 - `tools/agg-sweep.py` — aggregate sweep with the workload split +
   corruption spot-check
+- `tools/mixed-tax-probe.py` — decode-beside-deep-prefill probe (the
+  decode-fairness instrument)
 - `tools/mixed-battery.py` — the mixed-surface acceptance battery
   (interactive + chat + vision + co-tenant legs, memory floor)
 - `tools/boot-shape-warmup.sh` — boot-time shape/JIT warmup
   (~95 shapes, tokenize-gated ladder, sampler-combo postcondition)
-- `docs/FIXLOG.md` — 29 rungs, four ladders, including the retractions
+- `docs/FIXLOG.md` — 33 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
 
