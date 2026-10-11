@@ -1,19 +1,21 @@
-# patches/ — the SP-prefill applier (sequence-parallel prefill at TP=3)
+# patches/ — the SP-prefill applier and the deferral-cadence applier
 
-`apply_sp_prefill.py` ports community sequence-parallel **prefill** onto
-this runtime's DeepSeek-V4.0 (Vision-Exp) tree, staged in correctness
-gated stages. It is a house-idiom applier, not a diff:
+Two appliers, both house-idiom appliers (not diffs), both:
 
-- **Marker-guarded and idempotent** — every edit lands inside a
-  `# --- DSV4V_SP_PREFILL* ---` marker block; re-running is a no-op.
-- **`--check`** reports status without changing anything;
-  **`--revert`** restores the `.spprebak` backups byte-exactly (and
-  removes the injected module).
+- **Marker-guarded and idempotent** — every edit lands inside a marked
+  block; re-running is a no-op (`--status` on the deferral applier
+  reports without changing).
 - **Fail-closed anchors** — every edit aborts unless its anchor text
   occurs exactly once in the expected file, so a diverged image tree
-  can never be half-patched. A pre-flight existence check runs before
-  the first byte is written.
+  can never be half-patched.
 - `py_compile` runs inside the apply on every edited file.
+
+## 1. `apply_sp_prefill.py` — sequence-parallel prefill at TP=3
+
+Ports community sequence-parallel **prefill** onto
+this runtime's DeepSeek-V4.0 (Vision-Exp) tree, staged in correctness
+gated stages. `--check` reports status; `--revert` restores the
+`.spprebak` backups byte-exactly.
 
 ## The stages (one runtime env var: `DSV4V_PREFILL_SP_STAGES`)
 
@@ -71,6 +73,58 @@ execution order).
 - The boot-time mtp-buffer hotfix recognizes its own patched form on
   container re-entry; the stage-2 edit keeps that guard verbatim below
   the SP block so re-starts (vs re-creates) skip cleanly.
+
+## 2. `apply_prefill_decode_interval.py` — decode fairness during deep prefills
+
+A scheduler patch for the mixed-load hole the adaptive-chunk contract
+leaves open: an interactive decode stream beside a deep cold prefill
+collapses to ~12× TPOT inflation with multi-second freezes, even with
+the chunk threshold configured. Two causes, both patched:
+
+- the adaptive cap lift checks for a decode-active request
+  *instantaneously* — async scheduling and spec-decode draft/verify
+  both create momentary windows where none is observable, so full-size
+  chunks slip past the threshold cap;
+- any step that carries a prefill chunk costs the chunk's full wall
+  time even with decode co-batched in the same forward.
+
+The patch gates both on a **recent-decode window** (decode scheduled
+within the last `N + 2` steps): while it holds, the chunk stays capped
+at the configured threshold in both scheduler loops, and a prefill
+chunk may only run after ≥ `N` decode-favorable steps. Idle/solo
+prefill is untouched (full chunks — the SP engagement path); the signal
+ages out ~2 steps after decode drains, so prefill resumes full speed.
+
+**One env knob: `DSPARK_PREFILL_DECODE_INTERVAL`** — `2` ships (the
+serving point); `0`/unset means byte-equivalent behavior (gate the
+invocation so the patch is not even applied). Measured, same-night
+both arms, idle-gated on this stack: mean inflation ~12× → ~3×, worst
+gaps from the multi-second class to the ~1 s class, 4-stream ~6× → ~2×
+per stream with the median back at solo speed, and the mixed prefill
+rate itself *improves* (~14% → ~7–9% under solo). Outputs
+byte-identical (temp-0 exact-repeat batteries).
+
+**Applying** — it runs inside the container against the vLLM scheduler
+tree, **after the adaptive-chunk and issue-43 hotfixes** (it asserts
+both marks and refuses otherwise — ordering is enforced by the anchors,
+not the docs):
+
+```sh
+python3 apply_prefill_decode_interval.py --status   # APPLIED / NOT APPLIED
+python3 apply_prefill_decode_interval.py            # idempotent apply
+```
+
+For automatic application, stage it into the checkout's patch dir and
+add it to the entrypoint chain after the issue-43 patch, gated on the
+env knob (skip the invocation entirely at 0/unset). Recreating the
+containers reverts everything — the patches re-apply at boot.
+
+**Instrument:** `tools/mixed-tax-probe.py` (this repo) measures the
+effect: a solo decode stream re-measured while a same-depth fresh-nonce
+cold prefill runs. The engine-agnostic diagnostic for the underlying
+scheduler race: if your worst decode gap during a deep prefill matches
+the full-chunk quantum (`max_chunk_tokens / prefill_rate`) instead of
+your configured threshold, something is lifting the cap.
 
 ## Credits
 
