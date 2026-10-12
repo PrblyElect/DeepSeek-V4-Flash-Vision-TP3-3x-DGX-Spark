@@ -120,8 +120,10 @@ idle-gate in §2 passes):
 
 1. `needle-probe.py --selftest` — harness integrity.
 2. **Instructed needle ladder** at ~210K / ~320K / ~420K (word-exact,
-   fresh nonce each), plus a **~950K envelope probe** when the 1M window
-   matters to you (~15 min wall; ~1K tok/s class at that depth).
+   fresh nonce each; the judged word is the tool's short default token —
+   never a nonce-salad string, see FIXLOG rung 34), plus a **~950K
+   envelope probe** when the 1M window matters to you (~15 min wall;
+   ~1K tok/s class at that depth).
 3. **Vision fence**: single-image TTFT (~0.7 s class) and the 8-image
    cap — all eight left-colors named in order at TP=3.
 4. **Aggregate sweep** (`agg-sweep.py`) at 1/4/16/32 in both prompt
