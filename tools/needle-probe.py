@@ -16,6 +16,18 @@ in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
 2. Cold-corpus nonce: the nonce token at position ~1 makes every corpus
    differ from every other from the first block on, so repeat runs at the
    same depth cannot silently prefix-cache-hit.
+3. Echo-able judged word. The judged token must be SHORT (a
+   dictionary-style word plus a couple of digits). A judged "word" built
+   from a long random nonce — the natural instinct for uniqueness, and
+   exactly what a timestamp-nonce monitor produces — fails at the
+   temperature-0 copy margin: the model attends the needle and recalls
+   the stem (often the digits too) but truncates the random tail, and a
+   strict word-exact judge then reports context loss that never happened.
+   Days of phantom "deep-prefill corruption" here traced to precisely
+   that; short words recalled word-exact at every depth tested to ~1M.
+   The nonce busts the cache from corpus position 1; it never appears
+   inside the judged token. --salad-word preserves the old construction
+   for reproducing historical runs.
 
 Also measures per-depth prefill tok/s (read usage.prompt_tokens — the
 --depths target is a TOKEN ESTIMATE and the filler overshoots it by ~1.6x,
@@ -114,6 +126,11 @@ def main() -> int:
     ap.add_argument("--depths", default="131072,262144,524288",
                     help="token ESTIMATES; the corpus overshoots ~1.6x — read the reported prompt_tokens")
     ap.add_argument("--nonce", default="", help="distinguishes corpora so repeat runs miss the prefix cache")
+    ap.add_argument("--salad-word", action="store_true",
+                    help="legacy judged word: model-token + full nonce + doubled suffix "
+                         "(up to ~60 random chars). Echo-marginal at temperature 0 — "
+                         "fails as partial recall, not context loss. Only for "
+                         "reproducing historical runs.")
     ap.add_argument("--legacy", action="store_true",
                     help="UNINSTRUCTED corpus (measures continuation style, NOT recall) — "
                          "historical reproduction only")
@@ -158,9 +175,13 @@ def main() -> int:
     if not args.skip_needle:
         print(f"== context ladder ({'INSTRUCTED' if instruct else 'UNINSTRUCTED/legacy — not a recall gate'}) ==")
         for depth in [int(x) for x in args.depths.split(",")]:
-            word = f"raptor{depth % 977}{args.nonce}"
-            prompt = needle(depth, word + (f'-{args.nonce}' if args.nonce else ''),
-                            instruct=instruct, nonce=args.nonce)
+            if args.salad_word:
+                word = f"raptor{depth % 977}{args.nonce}"
+                embedded = word + (f'-{args.nonce}' if args.nonce else '')
+            else:
+                word = f"marigold{depth % 89}"
+                embedded = word
+            prompt = needle(depth, embedded, instruct=instruct, nonce=args.nonce)
             try:
                 txt, pt, wall = chat(lane, args.model, prompt, max_tokens=40)
                 ok = word in txt
