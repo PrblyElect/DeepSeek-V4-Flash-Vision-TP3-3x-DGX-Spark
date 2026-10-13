@@ -6,21 +6,22 @@ hold the engine: the admission-starvation axis the chunk threshold and
 the deferral-cadence patch do not cover (they protect streams that are
 already running; this measures requests that are still WAITING).
 
-Shape: idle chat TTFT (3 samples) -> two fresh-nonce bulk prefills fill
-the partial-prefill cap -> mid-flight, a small chat request and a
+Shape: idle chat reply wall (3 samples) -> two fresh-nonce bulk prefills
+fill the partial-prefill cap -> mid-flight, a small chat request and a
 parallel decode stream fire. Reports:
 
-  - idle chat TTFT (the baseline)
-  - chat TTFT mid-bulk        (THE number: the admission axis)
+  - idle chat reply wall (the baseline)
+  - chat reply wall mid-bulk    (THE number: the admission axis — the
+    full completion of a <=8-token answer, so within ~1 s of true TTFT)
   - worst inter-token gap on the parallel decode stream
-  - each bulk's TTFT + wall + needle-found (correctness: the needle
+  - each bulk's wall + needle-found (correctness: the needle
     must survive any chunk-boundary preemption + resume)
 
 Expectations on the patched stack (both patches applied, priority
 policy on): chat mid-bulk in the single-digit-seconds class — bounded
 below by the chunk already in flight when the request arrives, not by
 the queue — worst decode gap unchanged from the ~1 s class, needles
-found. A minutes-class chat TTFT means admission is broken or the
+found. A minutes-class chat wall means admission is broken or the
 admission patch is off / the policy flag is missing (check
 DSPARK_INTERACTIVE_ADMISSION and --scheduling-policy priority).
 
@@ -174,17 +175,17 @@ def main():
     for i in range(3):
         dt, _ = chat([{"role": "user", "content": f"Say the word 'ready' and nothing else. ({i})"}], 8)
         ttfts.append(dt)
-    RESULTS["idle_chat_ttft_s"] = ttfts
-    print(f"[{LABEL}] idle chat TTFT: {[round(t, 2) for t in ttfts]}s", flush=True)
+    RESULTS["idle_chat_wall_s"] = ttfts
+    print(f"[{LABEL}] idle chat wall: {[round(t, 2) for t in ttfts]}s", flush=True)
     time.sleep(2)
 
     bulks = []
     def run_bulk(i):
         msgs, codeword = bulk_corpus(i)
         t0 = time.monotonic()
-        ttft, text = chat(msgs, 64, stream=False)
+        _, text = chat(msgs, 64, stream=False)
         wall = time.monotonic() - t0
-        bulks.append({"idx": i, "ttft_s": ttft, "wall_s": wall,
+        bulks.append({"idx": i, "wall_s": wall,
                       "found": codeword in text, "reply": text[:80]})
         print(f"[{LABEL}] bulk{i}: wall={wall:.1f}s reply={text[:60]!r}", flush=True)
 
@@ -197,9 +198,9 @@ def main():
     def fire_chat():
         t0 = time.monotonic()
         dt, reply = chat([{"role": "user", "content": "Reply with exactly: ACK"}], 8, timeout=1800)
-        chat_res["ttft"] = dt
+        chat_res["wall"] = dt
         chat_res["reply"] = reply
-        print(f"[{LABEL}] CHAT MID-BULK TTFT: {dt:.2f}s (reply={reply[:20]!r})", flush=True)
+        print(f"[{LABEL}] CHAT MID-BULK WALL: {dt:.2f}s (reply={reply[:20]!r})", flush=True)
     chat_t = threading.Thread(target=fire_chat)
     chat_t.start()
     time.sleep(0.3)
@@ -212,13 +213,13 @@ def main():
     print(f"[{LABEL}] decode stream: first={decode_first:.2f}s worst_gap="
           f"{RESULTS['decode_worst_gap_s']:.2f}s", flush=True)
     chat_t.join()
-    RESULTS["chat_midbulk_ttft_s"] = chat_res.get("ttft")
+    RESULTS["chat_midbulk_wall_s"] = chat_res.get("wall")
 
     for t in threads:
         t.join()
     RESULTS["bulks"] = bulks
     print(f"\n[{LABEL}] SUMMARY: idle={[round(t, 2) for t in ttfts]} "
-          f"chat_midbulk={RESULTS['chat_midbulk_ttft_s']:.2f}s decode_worst_gap="
+          f"chat_midbulk={RESULTS['chat_midbulk_wall_s']:.2f}s decode_worst_gap="
           f"{RESULTS['decode_worst_gap_s']:.2f}s "
           f"needles={'/'.join('OK' if b['found'] else 'MISS' for b in bulks)} "
           f"bulk_walls={[round(b['wall_s'], 1) for b in bulks]}", flush=True)
