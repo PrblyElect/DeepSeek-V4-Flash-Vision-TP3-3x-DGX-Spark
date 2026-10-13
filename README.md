@@ -54,8 +54,10 @@ The serving config of record: DSpark k=5 · 32 seqs (capture 192) ·
 MNBT 8192 · long-prefill threshold 1024 (measured optimum) ·
 adaptive chunk ON (solo deep prefills run as full ~8K chunks — the SP
 engagement switch) · **prefill-decode deferral cadence N=2** (decode
-fairness beside deep prefills — see below) · SP stage 3 · gmu 0.80 ·
-1M context. Every axis carries a measured verdict or a recorded
+fairness beside deep prefills — see below) · **interactive admission
+ON** (arriving chats protected mid-bulk; requires the
+`--scheduling-policy priority` serve flag — see below) · SP stage 3 ·
+gmu 0.80 · 1M context. Every axis carries a measured verdict or a recorded
 blocker (`docs/FIXLOG.md`).
 
 The recipe is checkpoint-agnostic within the Vision-Exp family: serve
@@ -108,6 +110,7 @@ labeling discipline of `docs/VALIDATION.md`.
 | Solo deep prefill | **~1.5K tok/s @ ~420K context** (warm; cold-first pays ~1.6× JIT; ±10% per-boot — see lottery below) · ~1.6K @ ~320K · ~1.8K @ ~210K · ~3.2K shallow |
 | Mixed-serving deep prefill | ~1.3K tok/s at the same depth (a structural **~20% mixed tax** — prefill is the serial resource; both alternatives measured worse) |
 | Decode beside a deep prefill | **~3× TPOT inflation, worst gaps in the ~1 s class, median ≈ solo speed** (deferral cadence ON; 4-stream ~2×/stream) — was **~12× with multi-second freezes** before it; mixed prefill itself improves (~14% → ~7–9% under solo) |
+| Chat arriving mid-deep-prefill | **single-digit-seconds TTFT** (admission ON; bounded below by the one chunk already in flight) — was **minutes-class** (queued behind the bulk work until it finished); bulk pays ≤ ~20% wall, bounded by two yields per request |
 | Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound: ~9/10 tokens accepted/drafted at k=5) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
 | KV pool | **~4.3M tokens ≈ 4.1 full-1M sessions** at gmu 0.80 (boot jitter ±10%; the pool is the min across ranks) |
@@ -155,6 +158,35 @@ instrument; the engine-agnostic tell for the underlying race is a
 worst decode gap that matches your full-chunk quantum
 (`max_chunk_tokens / prefill_rate`) instead of your configured
 threshold.
+
+### Interactive admission during deep prefills
+
+The sibling axis: a request that *arrives* while deep prefills hold
+the partial-prefill cap — not already decoding, so the cadence patch
+cannot see it. Stock behavior queues it behind the bulk work: a chat
+fired mid-bulk waits the minutes-class time for the first bulk to
+finish. `patches/apply_interactive_admission.py` adds size-inferred
+priority classes, a chunk-boundary yield (a waiting interactive request
+makes one running bulk prefill step aside — at most twice per bulk,
+ever, so bulk cannot starve), and the piece a measurement was needed
+to find: a **waiting-interactive budget guard**. The yield alone frees
+a cap slot, not token budget — with nothing decoding, the adaptive
+lift hands the surviving bulk full-size chunks and it consumes the
+whole step budget, so the yield-only cut measured slightly *worse*
+than no patch. The guard holds chunks at the threshold while an
+interactive request waits, and the chat lands in
+**single-digit-seconds** (measured both arms, quiet idle-gated boots;
+the floor is the one chunk already in flight when the request
+arrives). Decode-active requests are never yield victims; deep-prefill
+walls pay ≤ ~20% with live interactive traffic interleaved; needles
+stay word-exact through the preempt-recompute-resume cycle — and a
+yielded bulk's resume is a full recompute on a loaded stack, so don't
+budget a cache-walk. Enable with `DSPARK_INTERACTIVE_ADMISSION=1` plus
+the `--scheduling-policy priority` flag on the serve line (the flag
+alone is inert with all-default priorities); `tools/fairness-probe.py`
+is the instrument — together the two patches are interactive immunity:
+running streams protected by cadence, arriving requests protected by
+admission.
 
 ## The methodology (this recipe's other product)
 
@@ -311,6 +343,7 @@ patched V4.1 lanes, and neither does ours.
 | TP=3 pad | the localaiguyy kit (MIT), applied by the checkout at `TP_SIZE=3` |
 | SP prefill | this repo's `patches/apply_sp_prefill.py`, stage 3, chained after the pad kit |
 | Decode fairness | this repo's `patches/apply_prefill_decode_interval.py` at N=2 (`DSPARK_PREFILL_DECODE_INTERVAL`; 0/unset = not applied) |
+| Interactive admission | this repo's `patches/apply_interactive_admission.py` (`DSPARK_INTERACTIVE_ADMISSION=1` + `--scheduling-policy priority` on the serve line; 0/unset = not applied) |
 | Spec decode | DSpark k=5 probabilistic (trained in-checkpoint drafter) |
 | KV | image-default `nvfp4_ds_mla` (fp8 measured and rejected — rung 10) |
 
@@ -399,6 +432,16 @@ Full detail per rung in `docs/FIXLOG.md`.
     that looks clean at the link layer (link state, error counters,
     bandwidth tests all green). After any fabric change, audit every
     box with `ip -br addr`.
+21. **The admission patch needs its policy flag**: the knob and
+    `--scheduling-policy priority` travel together — a mismatch logs a
+    loud warning and silently disables interactive admission (the
+    engine itself is unaffected). And remember the budget hole when
+    tuning: freeing an inflight-prefill **slot** frees no token
+    **budget** — a step whose running loop consumes the whole
+    `max_num_batched_tokens` on one full-size chunk admits nothing
+    from the waiting queue no matter how many slots are open
+    (`tools/fairness-probe.py`'s minutes-class chat TTFT with free
+    slots is exactly this signature).
 
 ## Repo layout
 
@@ -409,6 +452,10 @@ Full detail per rung in `docs/FIXLOG.md`.
 - `patches/apply_prefill_decode_interval.py` — the decode-fairness
   deferral-cadence applier (env-gated, idempotent, anchor-enforced
   ordering after adaptive-chunk + issue-43)
+- `patches/apply_interactive_admission.py` — the interactive-first
+  admission applier: size-inferred classes + chunk-boundary yield +
+  the waiting-interactive budget guard (env-gated, idempotent,
+  anchor-enforced ordering after the deferral applier)
 - `patches/README.md` — stage semantics, chaining, engineering
   constraints, credits
 - `tools/needle-probe.py` — the instructed-recall ladder + vision fence
@@ -417,11 +464,14 @@ Full detail per rung in `docs/FIXLOG.md`.
   corruption spot-check
 - `tools/mixed-tax-probe.py` — decode-beside-deep-prefill probe (the
   decode-fairness instrument)
+- `tools/fairness-probe.py` — the admission probe: chat + decode stream
+  fired mid-bulk, needle correctness through preempt-resume (the
+  admission-fairness instrument)
 - `tools/mixed-battery.py` — the mixed-surface acceptance battery
   (interactive + chat + vision + co-tenant legs, memory floor)
 - `tools/boot-shape-warmup.sh` — boot-time shape/JIT warmup
   (~95 shapes, tokenize-gated ladder, sampler-combo postcondition)
-- `docs/FIXLOG.md` — 34 rungs, four ladders, including the retractions
+- `docs/FIXLOG.md` — 35 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
 
