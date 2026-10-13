@@ -116,7 +116,8 @@ labeling discipline of `docs/VALIDATION.md`.
 | Mixed-serving deep prefill | ~1.3K tok/s at the same depth (a structural **~20% mixed tax** — prefill is the serial resource; both alternatives measured worse) |
 | Decode beside a deep prefill | **~3× TPOT inflation, worst gaps in the ~1 s class, median ≈ solo speed** (deferral cadence ON; 4-stream ~2×/stream) — was **~12× with multi-second freezes** before it; mixed prefill itself improves (~14% → ~7–9% under solo) |
 | Chat arriving mid-deep-prefill | **single-digit-seconds to a full short reply** (admission ON; measured as completion wall on a ≤8-token answer, bounded below by the one chunk already in flight) — was **minutes-class** (queued behind the bulk work until it finished); bulk pays ≤ ~20% wall, bounded by two yields per request |
-| Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound: ~9/10 tokens accepted/drafted at k=5) |
+| Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound; acceptance ladder in the class row below) |
+| Decode by generation class | accepted/drafted at k=5, per measured class: **~9/10** count/code · **~2/3** schema-bound tool calls · **~40%** reasoning (thinking on) · **~1/4** free prose — per-step token yield scales with (1 + 5 × acceptance) (wall-clock adds each class's step cost), so tool-heavy agentic traffic with thinking on runs the **~55–76 tok/s** class, not the count-class headline (speculative decoding stays active with thinking on) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
 | KV pool | **~4.3M tokens ≈ 4.1 full-1M sessions** at gmu 0.80 (boot jitter ±10%; the pool is the min across ranks) |
 | Long-context recall | instructed needle **word-exact to ~950K tokens** (~1K tok/s prefill at that depth); 1M is configured and pool-proven |
@@ -299,8 +300,15 @@ records what each rule cost to learn.
   full windows. If you serve near the envelope, run the ~950K probe
   yourself — it is one command and ~15 min.
 - **Thinking mode** defaults high on this family's reasoning parser:
-  budget `reasoning_content` inside `max_tokens`, or send
+  budget the reasoning stream inside `max_tokens`, or send
   `chat_template_kwargs: {"thinking": false}` for latency-bound loops.
+  On this runtime the thinking stream arrives as **`reasoning`** —
+  streaming `delta.reasoning`, non-streaming `message.reasoning` — not
+  `reasoning_content`; a client reading the wrong field silently
+  under-counts what it is paying for. Speculative decoding stays active
+  while thinking runs, so a tool-heavy agentic client should expect the
+  ~55–76 tok/s class in the numbers table above, not the count-class
+  headline.
 - **Concurrency**: interactive streams sit in the ~99 tok/s class at low
   concurrency; aggregate climbs to ~1K at the 32-way cap (per-stream
   ~30 — batch class, not interactive).
@@ -488,7 +496,7 @@ Full detail per rung in `docs/FIXLOG.md`.
   (interactive + chat + vision + co-tenant legs, memory floor)
 - `tools/boot-shape-warmup.sh` — boot-time shape/JIT warmup
   (~95 shapes, tokenize-gated ladder, sampler-combo postcondition)
-- `docs/FIXLOG.md` — 35 rungs, four ladders, including the retractions
+- `docs/FIXLOG.md` — 36 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
 - `.gitignore` — keeps logs and Python caches out of the tree
