@@ -26,6 +26,33 @@ gated stages. `--check` reports status; `--revert` restores the
 | 3 | **The narrow attention front** (what the serving profile ships): SWA-only layers run their row-wise front on local rows and all-gather the narrow q/kv product instead of the wide hidden state | adds onto stage 2 |
 | 4 | The indexer query-side row split (documented variant — correctness-clean, no measured speed case on this stack; `--stages 4` emits it, `--stages <=3` emits **zero** stage-4 bytes so the tree stays byte-identical to the stage-3 output) | research |
 
+
+Three appliers, all house-idiom appliers (not diffs), all:
+
+- **Marker-guarded and idempotent** — every edit lands inside a marked
+  block; re-running is a no-op (`--status` on the deferral and
+  admission appliers reports without changing).
+- **Fail-closed anchors** — every edit aborts unless its anchor text
+  occurs exactly once in the expected file, so a diverged image tree
+  can never be half-patched.
+- `py_compile` runs inside the apply on every edited file.
+
+## 1. `apply_sp_prefill.py` — sequence-parallel prefill at TP=3
+
+Ports community sequence-parallel **prefill** onto
+this runtime's DeepSeek-V4.0 (Vision-Exp) tree, staged in correctness
+gated stages. `--check` reports status; `--revert` restores the
+`.spprebak` backups byte-exactly.
+
+## The stages (one runtime env var: `DSV4V_PREFILL_SP_STAGES`)
+
+| Stage | What it does | When it is active |
+|---|---|---|
+| 1 | Embedding reduce-scatter, gathered straight back — **bit-identical outputs** (each token has exactly one owning vocabulary shard) | scaffolding; exercises the row math and collectives with a correctness gate before any dataflow change |
+| 2 | Sharded inter-layer state: the row-wise mHC/norm/residual work runs on local rows; the MoE late all-reduce and the attention-output all-reduce become reduce-scatters | long prefills only (see the threshold below) |
+| 3 | **The narrow attention front** (what the serving profile ships): SWA-only layers run their row-wise front on local rows and all-gather the narrow q/kv product instead of the wide hidden state | adds onto stage 2 |
+| 4 | The indexer query-side row split (documented variant — correctness-clean, no measured speed case on this stack; `--stages 4` emits it, `--stages <=3` emits **zero** stage-4 bytes so the tree stays byte-identical to the stage-3 output) | research |
+
 `DSV4V_PREFILL_SP_MIN_ROWS` (the recipe ships 4097) is the row threshold:
 below it everything is stock, and the resolver auto-raises it above the
 decode ceiling (`max_num_seqs × (1 + k)` and the capture size), so decode
@@ -125,6 +152,74 @@ cold prefill runs. The engine-agnostic diagnostic for the underlying
 scheduler race: if your worst decode gap during a deep prefill matches
 the full-chunk quantum (`max_chunk_tokens / prefill_rate`) instead of
 your configured threshold, something is lifting the cap.
+
+## 3. `apply_interactive_admission.py` — interactive-first admission
+
+The deferral applier protects streams that are already decoding. This
+one protects requests that are still **waiting**: admission is a single
+FIFO queue plus the runtime's partial-prefill cap
+(`DSPARK_MAX_INFLIGHT_PREFILLS`), so while deep prefills hold the cap,
+every arriving interactive request queues behind them — a chat fired
+mid-bulk waits the minutes-class time for the first bulk to finish,
+with the engine perfectly healthy. Three mechanisms, one master knob:
+
+- **Size-inferred classes** (`DSPARK_INTERACTIVE_MAX_PROMPT_TOKENS`,
+  default 32768): prompts above the threshold are bulk — priority
+  demoted (`DSPARK_BULK_PRIORITY`, default 100) under
+  `--scheduling-policy priority`, so the waiting heap orders every
+  interactive request ahead of bulk. Zero client/protocol changes.
+- **Chunk-boundary yield** (`DSPARK_BULK_YIELD_LIMIT`, default 2): a
+  waiting interactive request makes one running bulk prefill yield per
+  step, via the engine's own `_preempt_request` (the memory-pressure
+  transition). After two yields the bulk is immune — bulk cannot
+  starve. Decode-active requests are never victims by construction.
+- **Waiting-interactive budget guard** (the v2 mechanism, and the one
+  a measurement was needed to find): the yield alone frees a cap SLOT,
+  not TOKEN BUDGET — with nothing decoding, the adaptive lift hands the
+  surviving solo bulk full-size chunks, it consumes the whole step
+  budget, and the waiting loop still admits nothing (measured both
+  arms on quiet idle-gated boots: the yield alone was slightly WORSE
+  than no patch). The guard holds chunks at the threshold in both
+  scheduler loops while the waiting head is interactive, leaving the
+  rest of every step's budget for the owed admission.
+
+Net, measured on this stack: mid-bulk chat TTFT minutes-class →
+**single-digit seconds** (bounded below by the one chunk already in
+flight when the request arrives — that is the physical floor, not a
+queue), worst decode gap unchanged, deep-prefill wall penalty
+upper-bounded ~20% under live interactive interleaving (expected under
+~10% from the bound math), and deep needles survive the
+preempt-recompute-resume cycle word-exact. One refuted assumption
+recorded: a yielded bulk's resume is a full recompute on a loaded
+stack (the freed blocks are reconsumed) — do not budget a
+prefix-cache-walk resume here.
+
+**One env knob + one flag**: `DSPARK_INTERACTIVE_ADMISSION=1` and
+`--scheduling-policy priority` added to the serve line (a mismatch
+logs a loud warning and disables the feature — fail-visible; with
+all-default priorities the priority queue behaves exactly FCFS, so
+the flag alone changes nothing else). `0`/unset = not applied.
+
+**Applying** — it runs inside the container against the vLLM scheduler
+tree, **after the deferral-cadence applier** (it asserts the
+deferral, issue-43 and adaptive-chunk marks and refuses otherwise —
+ordering is enforced by the anchors, not the docs):
+
+```sh
+python3 apply_interactive_admission.py --status   # APPLIED / NOT APPLIED
+python3 apply_interactive_admission.py            # idempotent apply
+```
+
+Version note: a previous-version mark on a reused container filesystem
+is a hard error by design — recreate the containers (the documented
+boot path) rather than restarting them.
+
+**Instrument:** `tools/fairness-probe.py` (this repo): two fresh-nonce
+bulk prefills fill the cap, then a small chat and a parallel decode
+stream fire mid-flight. The engine-agnostic tell for the budget hole:
+an interactive request that still waits minutes despite the inflight
+cap having free slots — the step's token budget, not the slot count,
+is the binding constraint.
 
 ## Credits
 
