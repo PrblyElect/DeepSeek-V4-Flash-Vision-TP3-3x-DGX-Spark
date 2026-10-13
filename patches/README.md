@@ -97,12 +97,10 @@ ages out ~2 steps after decode drains, so prefill resumes full speed.
 
 **One env knob: `DSPARK_PREFILL_DECODE_INTERVAL`** — `2` ships (the
 serving point); `0`/unset means byte-equivalent behavior (gate the
-invocation so the patch is not even applied). Measured, same-night
-both arms, idle-gated on this stack: mean inflation ~12× → ~3×, worst
-gaps from the multi-second class to the ~1 s class, 4-stream ~6× → ~2×
-per stream with the median back at solo speed, and the mixed prefill
-rate itself *improves* (~14% → ~7–9% under solo). Outputs
-byte-identical (temp-0 exact-repeat batteries).
+invocation so the patch is not even applied). Measured headline: mean
+inflation ~12× → ~3× with worst gaps to the ~1 s class and the median
+back at solo speed, outputs byte-identical — the full both-arms record
+is FIXLOG rung 33.
 
 **Applying** — it runs inside the container against the vLLM scheduler
 tree, **after the adaptive-chunk and issue-43 hotfixes** (it asserts
@@ -156,16 +154,15 @@ with the engine perfectly healthy. Three mechanisms, one master knob:
   scheduler loops while the waiting head is interactive, leaving the
   rest of every step's budget for the owed admission.
 
-Net, measured on this stack: mid-bulk chat TTFT minutes-class →
-**single-digit seconds** (bounded below by the one chunk already in
-flight when the request arrives — that is the physical floor, not a
-queue), worst decode gap unchanged, deep-prefill wall penalty
-upper-bounded ~20% under live interactive interleaving (expected under
-~10% from the bound math), and deep needles survive the
-preempt-recompute-resume cycle word-exact. One refuted assumption
-recorded: a yielded bulk's resume is a full recompute on a loaded
-stack (the freed blocks are reconsumed) — do not budget a
-prefix-cache-walk resume here.
+Net, measured on this stack: mid-bulk chat wall (full short
+completion) minutes-class → **single-digit seconds** (bounded below by
+the one chunk already in flight when the request arrives — that is the
+physical floor, not a queue), worst decode gap unchanged, deep-prefill
+wall penalty upper-bounded ~20%, needles word-exact through
+preempt-recompute-resume — full both-arms record in FIXLOG rung 35,
+including the refuted assumption worth keeping: a yielded bulk's
+resume is a full recompute on a loaded stack (the freed blocks are
+reconsumed) — do not budget a prefix-cache-walk resume here.
 
 **One env knob + one flag**: `DSPARK_INTERACTIVE_ADMISSION=1` and
 `--scheduling-policy priority` added to the serve line (a mismatch
