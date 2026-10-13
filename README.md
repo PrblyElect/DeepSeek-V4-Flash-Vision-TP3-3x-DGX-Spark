@@ -355,6 +355,7 @@ patched V4.1 lanes, and neither does ours.
 | Runtime image | `ghcr.io/anemll/dspark-vllm-gx10` @ `sha256:a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8` (the v0.1.1 release line — the only public image of this line with a working multimodal class for this family; re-pin ⇒ re-validate the patches) |
 | Checkpoint | any Vision-Exp packaging; validated with the official repo @ `86f746b36186` (and an abliteration derivative of it — see above) |
 | TP=3 pad | the localaiguyy kit (MIT), applied by the checkout at `TP_SIZE=3` |
+| Boot machinery | the [MiaAI-Lab 2-Spark DSpark recipe checkout](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark) @ `97e8733238f8` (compose/launcher + env shape; stage it on all three boxes — Quick start step 2, and pin whatever rev you validate against) |
 | SP prefill | this repo's `patches/apply_sp_prefill.py`, stage 3, chained after the pad kit |
 | Decode fairness | this repo's `patches/apply_prefill_decode_interval.py` at N=2 (`DSPARK_PREFILL_DECODE_INTERVAL`; 0/unset = not applied) |
 | Interactive admission | this repo's `patches/apply_interactive_admission.py` (`DSPARK_INTERACTIVE_ADMISSION=1` + `--scheduling-policy priority` on the serve line; 0/unset = not applied) |
