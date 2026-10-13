@@ -87,7 +87,10 @@ a reused filesystem — force-remove and relaunch fresh instead.
   stack, the same depth measured mid-battery ~1.3K (a structural ~20%
   mixed tax; without the deferral patch, interactive streams drop to a
   few tok/s while a deep prefill runs — with it, ~3× inflation and
-  worst gaps in the ~1 s class). Publish the label with the number.
+  worst gaps in the ~1 s class). The admission patch covers the third
+  axis: an interactive request *arriving* while deep prefills hold the
+  inflight cap (single-digit-seconds TTFT with it; minutes-class
+  without). Publish the label with the number.
 - **Same-boot A/B only**: identical config spreads ±10% across boots
   (environmental boot state — the kernel autotune cache was proven
   byte-frozen across spreading boots). Within-boot comparisons are
@@ -134,8 +137,22 @@ idle-gate in §2 passes):
    with multi-second gaps means the deferral knob is off or was not
    applied; check `DSPARK_PREFILL_DECODE_INTERVAL` and the patch's
    `--status` inside the container).
-6. **Mixed battery** with the interactive floor (above).
-7. **Warm-prefix replay**: one stable ~24K prefix, cold call vs
+6. **Admission probe** (`fairness-probe.py --selftest` first, then the
+   live run, idle-gated): two fresh-nonce bulk prefills fill the inflight
+   cap (default ~200K tokens each — pass a `BULK_TOKENS` matching your
+   deep-workload class), then a small chat and a parallel decode stream
+   fire mid-flight —
+   expect chat TTFT in the single-digit-seconds class (bounded below by
+   the one chunk already in flight), worst decode gap in the ~1 s class,
+   and both needles word-exact through any preempt-recompute-resume. A
+   minutes-class chat TTFT means the admission knob is off, the policy
+   flag is missing, or the budget-guard hole is back (check
+   `DSPARK_INTERACTIVE_ADMISSION`, the serve line's
+   `--scheduling-policy priority`, and the patch's `--status` inside
+   the container — a loud `[dspark-iaa]` warning names a knob/policy
+   mismatch).
+7. **Mixed battery** with the interactive floor (above).
+8. **Warm-prefix replay**: one stable ~24K prefix, cold call vs
    second-call TTFT — the replay win on this stack is ~14× effective.
 
 ## 7. Record as you go
