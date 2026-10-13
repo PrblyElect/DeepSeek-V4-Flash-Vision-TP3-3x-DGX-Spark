@@ -89,8 +89,8 @@ a reused filesystem — force-remove and relaunch fresh instead.
   few tok/s while a deep prefill runs — with it, ~3× inflation and
   worst gaps in the ~1 s class). The admission patch covers the third
   axis: an interactive request *arriving* while deep prefills hold the
-  inflight cap (single-digit-seconds TTFT with it; minutes-class
-  without). Publish the label with the number.
+inflight cap (single-digit-seconds chat wall with it; minutes-class
+without). Publish the label with the number.
 - **Same-boot A/B only**: identical config spreads ±10% across boots
   (environmental boot state — the kernel autotune cache was proven
   byte-frozen across spreading boots). Within-boot comparisons are
@@ -108,13 +108,18 @@ a reused filesystem — force-remove and relaunch fresh instead.
 
 A boot is not healthy because single-class probes pass. The gate
 (`tools/mixed-battery.py`) runs interactive streams, chat, and image
-requests **in flight at the same time**, with reranker/embedder
-co-tenant services live when you run the full form, and host
-`MemAvailable` sampled throughout. On this stack the gate reads:
-interactive floor ~12 tok/s (min) with ~22 mean, chat ~14 mean,
-vision-in-flight 6/6, tenant legs green, 0 errors, and a several-GiB
-memory floor on the head box. A tenants-skipped run is a diagnostic,
-not a gate.
+requests **in flight at the same time**, plus two co-tenant service
+legs (`BATTERY_RERANK`/`BATTERY_EMBED` — point them at any small
+OpenAI-style /v1/rerank and /v1/embeddings services you host beside
+the engine; they stand in for whatever shares your boxes), with host
+`MemAvailable` sampled throughout. Gate floors: interactive ≥ 12
+tok/s min-of-samples (`BATTERY_FLOOR`; observed ~22 mean), chat mean
+≥ 3 (observed ~14), vision-in-flight 6/6, tenant legs green, 0
+errors, and a several-GiB memory floor on the head box. The co-tenant
+legs are what prove the headroom-by-design claim: a tenants-skipped
+run is a diagnostic, not a gate — on fully dedicated boxes the
+engine-surface legs are your gate and the headroom claim doesn't
+apply.
 
 ## 6. The gate battery (what "accepted" means here)
 
@@ -142,18 +147,20 @@ idle-gate in §2 passes):
    cap (default ~200K tokens each — pass a `BULK_TOKENS` matching your
    deep-workload class), then a small chat and a parallel decode stream
    fire mid-flight —
-   expect chat TTFT in the single-digit-seconds class (bounded below by
+   expect the chat's full-completion wall (≤8-token answer) in the
+   single-digit-seconds class (bounded below by
    the one chunk already in flight), worst decode gap in the ~1 s class,
    and both needles word-exact through any preempt-recompute-resume. A
-   minutes-class chat TTFT means the admission knob is off, the policy
+   minutes-class chat wall means the admission knob is off, the policy
    flag is missing, or the budget-guard hole is back (check
    `DSPARK_INTERACTIVE_ADMISSION`, the serve line's
    `--scheduling-policy priority`, and the patch's `--status` inside
    the container — a loud `[dspark-iaa]` warning names a knob/policy
    mismatch).
 7. **Mixed battery** with the interactive floor (above).
-8. **Warm-prefix replay**: one stable ~24K prefix, cold call vs
-   second-call TTFT — the replay win on this stack is ~14× effective.
+8. **Warm-prefix replay**: one stable ~24K prefix, cold call vs an
+   immediate second call from the same client — the second-call TTFT
+   ratio is the replay win, ~14× effective on this stack.
 
 ## 7. Record as you go
 
