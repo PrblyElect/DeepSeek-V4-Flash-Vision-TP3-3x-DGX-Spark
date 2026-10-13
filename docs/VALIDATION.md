@@ -23,7 +23,9 @@ under `tools/`, stdlib-only):
   assertions plus one tiny live instructed needle. Run it before every
   measurement session — both harness bugs this recipe's history records
   (an instruction-less corpus, a mid-corpus nonce) shipped before a
-  selftest existed.
+  selftest existed. The two correctness instruments (`needle-probe.py`,
+  `fairness-probe.py`) carry `--selftest`; the measurement tools are
+  validated by their own printed postconditions.
 - **Anti-contamination**: every prefill-class prompt embeds a fresh nonce
   at position ~1 so repeat runs cannot prefix-cache-hit and report cache
   replay as prefill.
