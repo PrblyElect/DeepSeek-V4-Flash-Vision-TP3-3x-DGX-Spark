@@ -1,31 +1,4 @@
-# patches/ — the SP-prefill applier and the deferral-cadence applier
-
-Two appliers, both house-idiom appliers (not diffs), both:
-
-- **Marker-guarded and idempotent** — every edit lands inside a marked
-  block; re-running is a no-op (`--status` on the deferral applier
-  reports without changing).
-- **Fail-closed anchors** — every edit aborts unless its anchor text
-  occurs exactly once in the expected file, so a diverged image tree
-  can never be half-patched.
-- `py_compile` runs inside the apply on every edited file.
-
-## 1. `apply_sp_prefill.py` — sequence-parallel prefill at TP=3
-
-Ports community sequence-parallel **prefill** onto
-this runtime's DeepSeek-V4.0 (Vision-Exp) tree, staged in correctness
-gated stages. `--check` reports status; `--revert` restores the
-`.spprebak` backups byte-exactly.
-
-## The stages (one runtime env var: `DSV4V_PREFILL_SP_STAGES`)
-
-| Stage | What it does | When it is active |
-|---|---|---|
-| 1 | Embedding reduce-scatter, gathered straight back — **bit-identical outputs** (each token has exactly one owning vocabulary shard) | scaffolding; exercises the row math and collectives with a correctness gate before any dataflow change |
-| 2 | Sharded inter-layer state: the row-wise mHC/norm/residual work runs on local rows; the MoE late all-reduce and the attention-output all-reduce become reduce-scatters | long prefills only (see the threshold below) |
-| 3 | **The narrow attention front** (what the serving profile ships): SWA-only layers run their row-wise front on local rows and all-gather the narrow q/kv product instead of the wide hidden state | adds onto stage 2 |
-| 4 | The indexer query-side row split (documented variant — correctness-clean, no measured speed case on this stack; `--stages 4` emits it, `--stages <=3` emits **zero** stage-4 bytes so the tree stays byte-identical to the stage-3 output) | research |
-
+# patches/ — the SP-prefill, deferral-cadence, and admission appliers
 
 Three appliers, all house-idiom appliers (not diffs), all:
 
