@@ -88,7 +88,7 @@ def gen_stream(prompt, max_tokens):
                 if ch.get("delta", {}).get("content") and ttft is None:
                     ttft = time.time() - t0
     dt = time.time() - t0
-    return (ntok / dt if dt > 0 else 0.0), ttft, 0
+    return (ntok / dt if dt > 0 else 0.0), ttft
 
 
 def split_png_b64(left_rgb, right_rgb, w=64, h=64):
@@ -108,7 +108,7 @@ lock = threading.Lock()
 def interactive(i):
     for r in range(4):
         try:
-            rate, _, _ = gen_stream(f"Editing task {i}-{r}: refactor this loop to use itertools and explain the change in one paragraph. The loop iterates rows and accumulates totals for report {r}.", 256)
+            rate, _ = gen_stream(f"Editing task {i}-{r}: refactor this loop to use itertools and explain the change in one paragraph. The loop iterates rows and accumulates totals for report {r}.", 256)
             with lock: interactive_rates.append(rate)
         except Exception as e:
             with lock: errors.append(f"interactive {i}-{r}: {e}")
@@ -116,7 +116,7 @@ def interactive(i):
 def chat(i):
     for r in range(6):
         try:
-            rate, _, _ = gen_stream(f"Chat message {i}-{r}: what are three quick tips for keeping houseplants alive?", 96)
+            rate, _ = gen_stream(f"Chat message {i}-{r}: what are three quick tips for keeping houseplants alive?", 96)
             with lock: chat_rates.append(rate)
         except Exception as e:
             with lock: errors.append(f"chat {i}-{r}: {e}")
@@ -206,4 +206,8 @@ for name, passed_, detail in results:
     print(f"{'PASS' if passed_ else 'FAIL'} {name}: {detail}")
 if mem_mins[0] < 999999:
     print(f"memory: min MemAvailable on this box during battery = {mem_mins[0]} MiB")
-print(f"wall {wall:.0f}s — MIXED BATTERY {'PASS' if ok else 'FAILURE'}")
+skipped = rr_skipped or em_skipped
+print(f"wall {wall:.0f}s — MIXED BATTERY {'PASS' if ok else 'FAILURE'}"
+      + (" (co-tenant legs skipped — diagnostic run, not the full gate)"
+         if skipped and ok else ""))
+raise SystemExit(0 if ok else 1)
