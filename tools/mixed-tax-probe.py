@@ -19,7 +19,7 @@ multi-second worst gaps; with it, ~3x with worst gaps in the ~1 s class
 and p50 near solo speed. Anti-contamination: every deep prefill carries
 a fresh nonce (the prefix cache can never replay a measurement) and the
 engine must be idle-gated before each stage (VALIDATION.md §2). Stdlib
-only; no redirects; bounded runtime."""
+only; loopback-only endpoints, no redirects; bounded runtime."""
 import json
 import os
 import threading
@@ -37,10 +37,12 @@ DECODE_MAX = 640
 REPS = 2
 
 
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
 def _validate(url):
     p = urllib.parse.urlparse(url)
-    if p.scheme not in ("http", "https"):
-        raise SystemExit(f"refusing non-http URL: {url}")
+    if p.scheme not in ("http", "https") or p.hostname not in ALLOWED_HOSTS:
+        raise SystemExit(f"refusing non-local URL: {url} (extend ALLOWED_HOSTS deliberately)")
     return url
 
 
