@@ -15,7 +15,7 @@
 # concurrency (all our chat prompts land BLOCK 256), and the longchunk tail
 # does not help either (~1342 tokens -> BLOCK 256, not a low bucket).
 #
-# Two mechanisms:
+# Three mechanisms:
 # - Bucket ladder: six plain POST /v1/completions requests whose prompts are
 #   built to encode exactly s tokens, s = {1, 6, 20, 45, 100, 200}, mapping via
 #   next_pow2(s+6) onto every live BLOCK key {8,16,32,64,128,256}. The
@@ -33,7 +33,7 @@
 #   greedy (temperature 0), so vllm/v1/sample/ops/topk_topp_triton.py's
 #   _topk_topp_kernel — dispatched only when a request carries top_k and/or
 #   top_p — was never warmed and JIT-compiled mid-serve (persistent-cache
-#   entries born 15:26/15:27 UTC on a serving box prove it). The pinned
+#   entries appearing mid-serve on a serving box prove it). The pinned
 #   runtime's enumerable compile-key axes are the TOPK_ENABLED x TOPP_ENABLED
 #   constexpr pair. BATCH_SIZE remains a plain TTIR runtime argument. Each
 #   combo runs once at C=1 and, when the profile permits it, in one C=3 burst:
