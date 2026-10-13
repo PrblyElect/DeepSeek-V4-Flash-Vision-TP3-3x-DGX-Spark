@@ -15,7 +15,8 @@ It does nothing for requests that are still WAITING: admission is a
 single FIFO queue plus the runtime's partial-prefill concurrency cap
 (``DSPARK_MAX_INFLIGHT_PREFILLS``), so while deep prefills hold the cap,
 every arriving interactive request queues behind them for the duration
-of the deep work — a chat fired mid-bulk measured a minutes-class TTFT
+of the deep work — a chat fired mid-bulk measured a minutes-class
+completion wall
 with the engine perfectly healthy (the number is the time for the first
 bulk to finish, not a malfunction).
 
@@ -28,7 +29,7 @@ Two mechanisms close it, and the second one took a measurement to find:
       leaves one solo bulk prefill running, it consumes the entire step
       budget in the running loop and the waiting loop can admit nothing
       until it finishes. Measured both arms on quiet idle-gated boots:
-      the yield ALONE made mid-bulk chat TTFT slightly WORSE than no
+      the yield ALONE made mid-bulk chat wall slightly WORSE than no
       patch (still minutes-class) — a clean demonstration that freeing
       a slot is not freeing budget.
 
@@ -37,7 +38,7 @@ Two mechanisms close it, and the second one took a measurement to find:
       the configured long-prefill token threshold in BOTH scheduler
       loops, so every step leaves the rest of its token budget for the
       admission the engine already owes. With (a) + (b) together the
-      mid-bulk chat TTFT drops to the single-digit-seconds class —
+      mid-bulk chat wall drops to the single-digit-seconds class —
       bounded below by the chunk already in flight when the request
       arrives (one full-chunk wall at this posture), not by the queue.
 
@@ -310,7 +311,7 @@ src = src.replace(
     + "            # floor so the step leaves token budget for its admission.\n"
     + "            # Without this the adaptive lift hands a solo bulk the whole\n"
     + "            # step budget and the waiting head starves on BUDGET even\n"
-    + "            # with cap slots free (measured: a minutes-class chat TTFT\n"
+    + "            # with cap slots free (measured: a minutes-class chat wall\n"
     + "            # with the yield alone).\n"
     + "            if _iaa_wait_interactive:\n"
     + "                _iaa_cap = self.scheduler_config.long_prefill_token_threshold\n"
