@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Instructed-recall needle ladder + vision fence probe. Stdlib-only.
 
-The recall probe this recipe standardizes on. Two hard-won rules are baked
-in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
+The recall probe this recipe standardizes on. Three hard-won rules are
+baked in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
 
 1. INSTRUCTED, always, for correctness gates. An instruction-less needle
    (filler + "NOTE: the magic word is X." and nothing else) measures the
@@ -24,7 +24,7 @@ in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
    the stem (often the digits too) but truncates the random tail, and a
    strict word-exact judge then reports context loss that never happened.
    Days of phantom "deep-prefill corruption" here traced to precisely
-   that; short words recalled word-exact at every depth tested to ~1M.
+   that; short words recalled word-exact at every depth tested to ~950K.
    The nonce busts the cache from corpus position 1; it never appears
    inside the judged token. --salad-word preserves the old construction
    for reproducing historical runs.
