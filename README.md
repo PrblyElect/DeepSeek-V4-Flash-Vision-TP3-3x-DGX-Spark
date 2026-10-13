@@ -22,7 +22,8 @@ streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.3M-token
 KV pool ≈ 4.1 simultaneous full-1M-context sessions**, instructed-recall
 verified **word-exact to ~950K tokens**, 8/8 images per request at
 ~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
-Boot is ~5 min with ~95 pre-warmed shapes and zero mid-serve JIT. The
+Boot is ~5 min with ~95 pre-warmed shapes (C=1–16 + sampler combos) and
+zero mid-serve JIT. The
 defaults leave **~5–10 GiB/box of headroom for co-tenant services** — that
 is part of the spec, not a leftover (**Headroom by design** below).
 
@@ -70,8 +71,10 @@ refusal/sanity probe on whichever you choose).
 
 This repo ships the profile (env), the SP patch layer, the acceptance
 harness, and the measured why. Bring-up rides two public upstream repos:
-the pad kit above and the public 2-Spark DSpark vision recipe line that
-provides the compose/launcher machinery.
+the pad kit above and [MiaAI-Lab's 2-Spark DSpark recipe
+line](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark),
+which provides the compose/launcher machinery — checkout a pinned commit
+and record the rev you validate against.
 
 1. Stage the checkpoint on **all three** boxes (identical path):
 ```sh
@@ -81,10 +84,12 @@ hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
 # (serving an abliteration derivative instead? stage that repo/revision and
 #  keep any runtime-abliteration flag at 0 — the weights are already ablated)
 ```
-2. Stage the upstream vision-recipe checkout on all three boxes and the
-   pad kit into its patch dir; drop this repo's `patches/` beside it and
-   chain the SP applier after the pad kit (`patches/README.md` — the
-   `__main__` stanza IS the execution order).
+2. Stage the [upstream 2-Spark DSpark recipe
+   checkout](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
+   on all three boxes (pinned to a recorded commit) and the pad kit into
+   its patch dir; drop this repo's `patches/` beside it and chain the SP
+   applier after the pad kit (`patches/README.md` — the `__main__` stanza
+   IS the execution order).
 3. Stage `config/cluster.env` as the checkout's env file; edit the
    `EDIT` blocks (hosts, checkpoint paths).
 4. Workers first, then head. The ring serves `:8000` in ~5 min; the
@@ -94,7 +99,7 @@ hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
 ```sh
 python3 tools/needle-probe.py --selftest
 python3 tools/needle-probe.py --depths 131072,196608,262144 --nonce fresh1   # ~210K/~320K/~420K instructed ladder
-bash   tools/boot-shape-warmup.sh http://spark-head:8000 ds4flash-vision
+DSPARK_WARMUP_MAX_CONCURRENCY=32 bash tools/boot-shape-warmup.sh http://127.0.0.1:8000 ds4flash-vision
 python3 tools/agg-sweep.py --levels 1,4,16,32
 BATTERY_LANE=http://127.0.0.1:8000 BATTERY_RERANK=... BATTERY_EMBED=... python3 tools/mixed-battery.py
 ```
@@ -110,7 +115,7 @@ labeling discipline of `docs/VALIDATION.md`.
 | Solo deep prefill | **~1.5K tok/s @ ~420K context** (warm; cold-first pays ~1.6× JIT; ±10% per-boot — see lottery below) · ~1.6K @ ~320K · ~1.8K @ ~210K · ~3.2K shallow |
 | Mixed-serving deep prefill | ~1.3K tok/s at the same depth (a structural **~20% mixed tax** — prefill is the serial resource; both alternatives measured worse) |
 | Decode beside a deep prefill | **~3× TPOT inflation, worst gaps in the ~1 s class, median ≈ solo speed** (deferral cadence ON; 4-stream ~2×/stream) — was **~12× with multi-second freezes** before it; mixed prefill itself improves (~14% → ~7–9% under solo) |
-| Chat arriving mid-deep-prefill | **single-digit-seconds TTFT** (admission ON; bounded below by the one chunk already in flight) — was **minutes-class** (queued behind the bulk work until it finished); bulk pays ≤ ~20% wall, bounded by two yields per request |
+| Chat arriving mid-deep-prefill | **single-digit-seconds to a full short reply** (admission ON; measured as completion wall on a ≤8-token answer, bounded below by the one chunk already in flight) — was **minutes-class** (queued behind the bulk work until it finished); bulk pays ≤ ~20% wall, bounded by two yields per request |
 | Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound: ~9/10 tokens accepted/drafted at k=5) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
 | KV pool | **~4.3M tokens ≈ 4.1 full-1M sessions** at gmu 0.80 (boot jitter ±10%; the pool is the min across ranks) |
@@ -130,11 +135,20 @@ processing, chat frontends. At the shipped gmu the boxes hold
 ~5–10 GiB steady with the lane serving, and a several-GiB floor holds
 through a mixed battery with the co-tenant services **live** (the
 acceptance gate's full form runs them in flight — a tenants-skipped run
-is a diagnostic, not a gate). 0.80 ships only because the GPU
-side-tenant class this stack once carried was retired; measured with
-that tenant live, 0.80 left ~1 GiB on the most-shared box — an
-OOM-under-tenant-burst waiting to fire. Spend the headroom deliberately;
-every gmu step in the FIXLOG records what it buys.
+is a diagnostic, not a gate). 0.80 assumes text-support-only co-tenants:
+measured with a GPU-side tenant live, it left ~1 GiB on the most-shared
+box — an OOM-under-tenant-burst waiting to fire; don't copy it across
+tenancies. Spend the headroom deliberately; every gmu step in the FIXLOG
+records what it buys.
+
+### Not tested / not claimed
+
+Contexts beyond ~950K exercised (1M is configured and pool-proven);
+multi-hour sustained soaks; TP sizes other than 3; re-quants of the
+checkpoint; the official-vs-derivative refusal delta on any build but
+the one we probed (re-run the refusal/sanity probe on your weights);
+non-English OCR-class vision workloads beyond the synthetic color
+fences.
 
 ### Decode fairness during deep prefills
 
@@ -257,9 +271,9 @@ records what each rule cost to learn.
 ## Variants (each is one env flip)
 
 - **Long-document**: MNBT 6144 + the image's sparse-MLA chunk hotfix →
-  **~3.9M pool** at ~−14% aggregate — for deep-research days when the
-  fourth full-1M session matters more than throughput. The hotfix is
-  load-bearing at 6144 (deep recall fails without it on this stack).
+  **~3.9M pool** at ~−14% aggregate — the recall-margin shape for
+  deep-research days. The hotfix is load-bearing at 6144 (deep recall
+  fails without it on this stack).
 - **seqs 16** (capture 96): lighter capture bill, ~720 @ 16-way — the
   interactive-friendlier shape if you never reach 32 streams.
 - **Max-pool batch**: MNBT 4096, no-spec-style usage → the biggest pool
@@ -281,7 +295,7 @@ records what each rule cost to learn.
   before judging speed, and never restart the lane casually: the boot
   wipes the prefix cache for every client at once.
 - **Exercise your real depth before trusting it.** Recall here is
-  verified to ~950K (instructed, word-exact); the pool math holds ~3.9
+  verified to ~950K (instructed, word-exact); the pool math holds ~4.1
   full windows. If you serve near the envelope, run the ~950K probe
   yourself — it is one command and ~15 min.
 - **Thinking mode** defaults high on this family's reasoning parser:
@@ -316,7 +330,7 @@ records what each rule cost to learn.
   checkpoint doesn't need.
 
 Net: three boxes buy **native vision at TP=3 with 32-way aggregate
-headroom, ~3.9 full-1M sessions, and verified ~950K recall**. Prefill
+headroom, ~4.1 full-1M sessions, and verified ~950K recall**. Prefill
 remains the frontier — nobody's 3-box V4.0 prefill matches the best
 patched V4.1 lanes, and neither does ours.
 
@@ -394,8 +408,9 @@ Full detail per rung in `docs/FIXLOG.md`.
     deep prefills engage SP only as full ~8K chunks (adaptive chunk ON).
     The engine's stage/split log lines are the engagement proof; the
     mixed-axis alternatives were measured and rejected.
-15. **gmu 0.80 is rejected on this stack** (measured ~1 GiB floor on the
-    most-shared box) — don't copy it across tenancies.
+15. **gmu 0.80 assumes text-support-only co-tenants** — with a GPU-side
+    tenant live it left a ~1 GiB floor on the most-shared box; don't
+    copy it across tenancies.
 16. **Boot hygiene**: workers first, head last; fresh `docker run` never
     `restart`; one GPU owner per box; drop caches every rank; a NIC
     stuck slow or a GPU latched below clock is fixed by a cold power
@@ -434,14 +449,15 @@ Full detail per rung in `docs/FIXLOG.md`.
     box with `ip -br addr`.
 21. **The admission patch needs its policy flag**: the knob and
     `--scheduling-policy priority` travel together — a mismatch logs a
-    loud warning and silently disables interactive admission (the
-    engine itself is unaffected). And remember the budget hole when
+    loud `[dspark-iaa]` warning and disables interactive admission
+    (fail-visible, never silent; the engine itself is unaffected). And
+    remember the budget hole when
     tuning: freeing an inflight-prefill **slot** frees no token
     **budget** — a step whose running loop consumes the whole
     `max_num_batched_tokens` on one full-size chunk admits nothing
     from the waiting queue no matter how many slots are open
-    (`tools/fairness-probe.py`'s minutes-class chat TTFT with free
-    slots is exactly this signature).
+    (`tools/fairness-probe.py`'s minutes-class chat wall with free slots
+    is exactly this signature).
 
 ## Repo layout
 
@@ -474,6 +490,7 @@ Full detail per rung in `docs/FIXLOG.md`.
 - `docs/FIXLOG.md` — 35 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
+- `.gitignore` — keeps logs and Python caches out of the tree
 
 ## What's next (roadmap, not needed for correctness)
 
@@ -497,30 +514,24 @@ Full detail per rung in `docs/FIXLOG.md`.
   CSF-capable runtime ships (the companion text-only recipe line
   carries the toolchain pattern).
 
-## Not tested / not claimed
-
-Contexts beyond ~950K exercised (1M is configured and pool-proven);
-multi-hour sustained soaks; TP sizes other than 3; re-quants of the
-checkpoint; the official-vs-derivative refusal delta on any build but
-the one we probed (re-run the refusal/sanity probe on your weights);
-non-English OCR-class vision workloads beyond the synthetic color
-fences.
-
 ## Credits & prior art
 
 - **localaiguyy** — [the attention-group pad kit](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark)
-  (MIT): the 8→9 pad geometry this lane stands on, the capture =
-  seqs × (k+1) rule, and the zeroed-sink landmine class.
+  (MIT): the 8→9 pad geometry this lane stands on, the TP3-shape
+  statement of the capture = seqs × (k+1) sizing rule, and the
+  zeroed-sink landmine class.
 - **Anemll** — the `dspark-vllm-gx10` runtime: the DSpark spec-decode
   stack and the working multimodal serving class that makes vision at
   TP>1 possible at all.
-- **MiaAI-Lab** — the public 2-Spark DSpark vision recipe line whose
-  env shape and boot machinery (including the warmup script this repo's
-  `tools/boot-shape-warmup.sh` adapts, with C=8/16 arms added) this
-  profile descends from, and the DS4-on-Spark bug documentation.
+- **MiaAI-Lab** — [the 2-Spark DSpark vision recipe
+  line](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
+  whose env shape and boot machinery (including the warmup script this
+  repo's `tools/boot-shape-warmup.sh` adapts, with C=8/16 arms added)
+  this profile descends from, and the DS4-on-Spark bug documentation.
 - **tonyd2wild** — the [2-Spark Vision-Exp DSpark/NVFP4-KV
   recipe](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)
-  we benchmark against.
+  we benchmark against, and the origin of the capture = seqs × (k+1)
+  sizing rule this recipe states for its own shape.
 - **christopher_owen** — the [V4.1 TP=3 reference
   thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438):
   the prefill-SP patch-series semantics this applier adapts, and the
