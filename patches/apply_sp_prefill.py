@@ -78,7 +78,7 @@ at module import, never per call).
 
 Idempotent: every edit is guarded by its marker, so re-running is a no-op.
 --check reports status without changing anything; --revert restores the
-.bak copies. Every edit fails closed if its anchor does not occur exactly
+.spprebak copies. Every edit fails closed if its anchor does not occur exactly
 once in the expected file.
 
 Usage:
@@ -101,10 +101,7 @@ MARK = "# --- DSV4V_SP_PREFILL ---"
 MARK2 = "# --- DSV4V_SP_PREFILL_S2 ---"
 MARK3 = "# --- DSV4V_SP_PREFILL_S3 ---"
 MARK4 = "# --- DSV4V_SP_PREFILL_S4 ---"
-MODULE_V2_TAG = "# DSV4V sp_prefill module version: 2 (stage 2: local_slice, stages_from_env)"
 MODULE_V3_TAG = "# DSV4V sp_prefill module version: 3 (stage 3: stages() accessor, narrow front)"
-MODULE_V4_TAG = "# DSV4V sp_prefill module version: 4 (stage 4: indexer row split, indexer_split_check)"
-MODULE_V5_TAG = "# DSV4V sp_prefill module version: 5 (stage 4 rev 2: stream-safe publish, no in-op collective)"
 MODULE_V6_TAG = "# DSV4V sp_prefill module version: 6 (rev2 edits, module reverted to ContextVar after the global broke compiled SP)"
 
 # ---------------------------------------------------------------------------
