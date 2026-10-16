@@ -32,8 +32,9 @@ baked in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
 Also measures per-depth prefill tok/s (read usage.prompt_tokens — the
 --depths target is a TOKEN ESTIMATE and the filler overshoots it by ~1.6x,
 so never compare "actual" token counts across harnesses), and runs the
-vision fence: single-image TTFT plus the model's 8-image-per-request cap
-at TP=3 (eight color-split images, all eight left colors named in order).
+vision fence: single-image TTFT plus the default 8-image-per-request cap
+(the engine's mm-limit flag, not a model limit — rung 37) at TP=3 (eight
+color-split images, all eight left colors named in order).
 
 --selftest runs the offline corpus assertions (plus one tiny live
 instructed needle when the lane answers) — run it before every
@@ -213,10 +214,10 @@ def main() -> int:
             txt, pt, wall = chat(lane, args.model, content, max_tokens=80)
             low = txt.lower()
             hits = sum(1 for c in colors if c in low)
-            print(f"  8-image cap: {hits}/8 left-colors named in order "
+            print(f"  8-image default cap: {hits}/8 left-colors named in order "
                   f"(prompt_tokens={pt}, wall={wall:.0f}s) -> {txt.strip()[:80]!r}")
         except Exception as exc:  # noqa: BLE001
-            print(f"  8-image cap FAIL: {str(exc)[:90]}")
+            print(f"  8-image default cap FAIL: {str(exc)[:90]}")
     return 0
 
 

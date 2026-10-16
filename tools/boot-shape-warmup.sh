@@ -24,11 +24,14 @@
 #   runtime with an authenticated POST /tokenize BEFORE its completion fires,
 #   and any count mismatch fails the rung — and the nonfatal warmup — with a
 #   precise, secret-free diagnostic instead of silently warming a wrong shape.
-# - Chat arms C=1/2/4/6 (bounded by the launcher's resolved
+# - Chat arms C=1..32 (bounded by the launcher's resolved
 #   --max-num-seqs) cover both bounded longer prompts and ordinary short
 #   requests with client-default generation settings. Medium + multi-chunk
 #   long prefill and one thinking-off arm cover other batch-keyed variants;
-#   none of these arms contributes to the low buckets above.
+#   none of these arms contributes to the low buckets above. A pair of
+#   concurrent ~52K-token prefills additionally warms the chunk-geometry
+#   kernels at prefill depth under concurrency — a mid-serve JIT class
+#   none of the arms above reaches.
 # - Sampling arms (added after an upstream serving incident): every arm runs
 #   greedy (temperature 0), so vllm/v1/sample/ops/topk_topp_triton.py's
 #   _topk_topp_kernel — dispatched only when a request carries top_k and/or
@@ -52,7 +55,7 @@
 #
 # Lineage: adapted from the boot shape-warmup script of the public
 # MiaAI-Lab DS4-on-Spark DSpark recipe line (see repository README credits),
-# extended with C=8/16 chat arms for the 32-seq shape.
+# extended with C=8/16/24/32 chat arms for the 32-seq shape.
 #
 # Usage: boot-shape-warmup.sh [base_url] [model]
 #   base_url default http://127.0.0.1:8000 ; model default ds4flash-vision
@@ -108,6 +111,7 @@ next_pow2() { # smallest power of two >= $1
 }
 
 tmpdir="$(mktemp -d)"
+mkdir -p "$tmpdir/payloads"   # staged request bodies; see fire()'s -d @file
 trap 'rm -rf "$tmpdir"' EXIT
 
 mk_prompt() { # $1 = approx token count (repeated filler words), $2 = tag
@@ -118,7 +122,7 @@ mk_prompt() { # $1 = approx token count (repeated filler words), $2 = tag
 }
 
 fire() { # $1 = tag, $2 = words, $3 = thinking, $4 = result file, $5 = request profile
-  local tag=$1 words=$2 thinking=$3 out=$4 profile=${5:-bounded} prompt payload sample_fields
+  local tag=$1 words=$2 thinking=$3 out=$4 profile=${5:-bounded} prompt payload payload_file sample_fields
   prompt=$(mk_prompt "$words" "$tag")
   if [ "$profile" = "serve-default" ]; then
     # Mirror an ordinary short client request: no explicit max_tokens or
@@ -138,9 +142,20 @@ fire() { # $1 = tag, $2 = words, $3 = thinking, $4 = result file, $5 = request p
   else
     payload='{"model":"'"$MODEL"'","messages":[{"role":"user","content":"'"$prompt"'"}],"max_tokens":24,"temperature":0,"chat_template_kwargs":{"thinking":'"$thinking"',"reasoning_effort":"low"}}'
   fi
+  # Post the body as a file (-d @file), never as an argv element: the
+  # giant-prompt arm builds a JSON document far past the kernel's
+  # per-argument limit (~128 KiB on Linux), and one oversized -d argument
+  # dies in execve (E2BIG) before curl even runs — instantly, with the
+  # shell's error dropped into this arm's stderr bucket where nobody
+  # looks, and the arm tallying a silent 0-second failure. A body file
+  # keeps arm size independent of argv limits. payloads/ (no dash in the
+  # name, one level below the outcome files) keeps these files out of the
+  # summary's top-level *-* outcome tally.
+  payload_file="$tmpdir/payloads/${tag}.json"
+  printf '%s' "$payload" > "$payload_file"
   if "$CURL_BIN" -fsS --max-time "$REQ_TIMEOUT" "${AUTH_ARGS[@]}" \
       "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
-      -d "$payload" >/dev/null 2>>"$tmpdir/errors"; then
+      -d @"$payload_file" >/dev/null 2>>"$tmpdir/errors"; then
     echo ok > "$out"
   else
     echo fail > "$out"
@@ -149,6 +164,12 @@ fire() { # $1 = tag, $2 = words, $3 = thinking, $4 = result file, $5 = request p
 
 burst() { # $1 = arm name, $2 = concurrency, $3 = words-per-request, $4 = request profile
   local arm=$1 c=$2 words=$3 profile=${4:-bounded} i t0 t1
+  # Self-tally: every scheduled request counts itself here, so the summary
+  # can never disagree with the arms that actually ran. A manually
+  # maintained count missed an arm's requests once, and the resulting
+  # internal-error exit fired BEFORE the failure report — masking the
+  # arm's own swallowed errors behind a cosmetic mismatch warning.
+  EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + c))
   # Pre-create every result file in the parent before forking so a subshell
   # that dies before writing still tallies as a failed outcome: the summary
   # can never claim n/n over fewer outcomes than requests scheduled.
@@ -280,29 +301,41 @@ total_t0=$(date +%s)
 # completions), then the batch/chat arms.
 ladder
 
-EXPECTED_CHAT_REQUESTS=8        # c1 + short-c1 + samp-k + samp-p + samp-kp + mid + longchunk + nothink
+EXPECTED_CHAT_REQUESTS=1        # the nothink fire() below; every burst() adds its own concurrency
 burst c1        1 300
 burst short-c1  1 8 serve-default
 # _topk_topp_kernel constexpr combos: k-only, p-only, k+p.
 burst samp-k    1 8 sampling-k
 burst samp-p    1 8 sampling-p
 burst samp-kp   1 8 sampling-kp
-if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 4)); fi
+if [ "$MAX_CONCURRENCY" -ge 2 ]; then burst c2 2 420; burst short-c2 2 8 serve-default; fi
 if [ "$MAX_CONCURRENCY" -ge 3 ]; then
   sampler_c3_arms
-  EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 9))
 fi
-if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 8)); fi
-if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 12)); fi
+if [ "$MAX_CONCURRENCY" -ge 4 ]; then burst c4 4 380; burst short-c4 4 8 serve-default; fi
+if [ "$MAX_CONCURRENCY" -ge 6 ]; then burst c6 6 340; burst short-c6 6 8 serve-default; fi
 # C=8/16 arms: batch shapes above C=6 are not covered by the base arms
 # and otherwise pay their first-burst JIT compile (measured watch item).
-if [ "$MAX_CONCURRENCY" -ge 8 ]; then burst c8 8 300; burst short-c8 8 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 16)); fi
-if [ "$MAX_CONCURRENCY" -ge 16 ]; then burst c16 16 260; burst short-c16 16 8 serve-default; EXPECTED_CHAT_REQUESTS=$((EXPECTED_CHAT_REQUESTS + 32)); fi
-if [ "$MAX_CONCURRENCY" -gt 16 ]; then
-  echo "boot-shape-warmup: WARN: MAX_NUM_SEQS=${MAX_CONCURRENCY}; batch shapes above C=16 are not pre-warmed" >&2
+if [ "$MAX_CONCURRENCY" -ge 8 ]; then burst c8 8 300; burst short-c8 8 8 serve-default; fi
+if [ "$MAX_CONCURRENCY" -ge 16 ]; then burst c16 16 260; burst short-c16 16 8 serve-default; fi
+# C=24/32 arms: a mid-serve Triton JIT (uncovered batch shape,
+# _build_prefill_chunk_metadata_kernel class) stalled a rank inside a TP
+# collective with no watchdog coverage — a hard multi-minute wedge with
+# all ranks spin-waiting. With MAX_NUM_SEQS=32, the >C=16 shapes were
+# exactly the uncovered class.
+if [ "$MAX_CONCURRENCY" -ge 24 ]; then burst c24 24 200; burst short-c24 24 8 serve-default; fi
+if [ "$MAX_CONCURRENCY" -ge 32 ]; then burst c32 32 160; burst short-c32 32 8 serve-default; fi
+if [ "$MAX_CONCURRENCY" -gt 32 ]; then
+  echo "boot-shape-warmup: WARN: MAX_NUM_SEQS=${MAX_CONCURRENCY}; batch shapes above C=32 are not pre-warmed" >&2
 fi
 burst mid       1 2600
 burst longchunk 1 9500          # crosses the 8192-token chunk boundary (BLOCK 256); its tail does NOT reach low buckets
+# Concurrent deep prefills JIT the _build_prefill_chunk_metadata_kernel
+# geometry mid-serve (chunk shapes at depth x concurrency are covered by
+# no arm above); when that compile loses its race inside a TP collective
+# the lane hard-wedges (rung 38). Warm the geometry at boot: two ~52K
+# token prefills at once.
+burst giantpair 2 52000
 t0=$(date +%s)
 : > "$tmpdir/nothink-1"          # pre-created: counted even on subshell death
 fire nothink-1 300 false "$tmpdir/nothink-1"
