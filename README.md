@@ -13,7 +13,8 @@ tags:
 # DeepSeek-V4-Flash Vision-Exp at TP=3 across 3× NVIDIA DGX Spark — with native vision
 
 **TL;DR** — Serve DeepSeek-V4-Flash-Vision-Exp (native weights, native
-ViT + Aligner vision, 8 images per request) tensor-parallel across three
+ViT + Aligner vision; per-request image count bounded by the engine flag,
+not the model) tensor-parallel across three
 DGX Sparks (GB10) on a CX-7 RoCE triangle, with DSpark k=5 speculative
 decoding and a ported sequence-parallel prefill path. As far as we can
 find this is the **first TP=3 serving of this checkpoint with the vision
@@ -22,8 +23,9 @@ streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.3M-token
 KV pool ≈ 4.1 simultaneous full-1M-context sessions**, instructed-recall
 verified **word-exact to ~950K tokens**, 8/8 images per request at
 ~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
-Boot is ~5 min with ~95 pre-warmed shapes (C=1–16 + sampler combos) and
-zero mid-serve JIT. The
+Boot is ~5 min with ~110-class pre-warmed shapes (C=1–32 + sampler combos),
+and the chunk-geometry JIT wedge class is **closed at the engine level** —
+one compiled variant for every prefill geometry, no mid-serve JIT. The
 defaults leave **~5–10 GiB/box of headroom for co-tenant services** — that
 is part of the spec, not a leftover (**Headroom by design** below).
 
@@ -38,7 +40,8 @@ demonstrably fooled itself without it (see **The methodology** and
 
 A serving profile for the Vision-Exp checkpoint — full native mixed
 FP4+FP8 weights (~170 GB), the checkpoint-local ViT + Aligner vision
-tower (user-message images only, 8 per request), and the trained DSpark
+tower (user-message images only; per-request count is the engine's
+mm-limit flag — default 8, validated far higher), and the trained DSpark
 draft module — at **TP=3** over three Sparks, made possible by:
 
 - the **attention-group pad 8→9 kit** ([localaiguyy](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark),
@@ -121,9 +124,9 @@ labeling discipline of `docs/VALIDATION.md`.
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
 | KV pool | **~4.3M tokens ≈ 4.1 full-1M sessions** at gmu 0.80 (boot jitter ±10%; the pool is the min across ranks) |
 | Long-context recall | instructed needle **word-exact to ~950K tokens** (~1K tok/s prefill at that depth); 1M is configured and pool-proven |
-| Vision | **8/8 images per request, in order**, at TP=3 · **~0.7 s image-TTFT** · multi-image color/position correct |
+| Vision | **8/8 images per request, in order**, at TP=3 · **~0.7 s image-TTFT** · multi-image color/position correct · the per-request image cap is the engine flag, not the model (validated upward to 128 small-image / 32 photo-scale — rung 37) |
 | Warm-prefix replay | **~14× effective TTFT** (a stable ~24K prefix replays at ~2 s wall vs a cold effective rate ~14× slower) |
-| Cold boot to serving | **~5 min**, ~95 warmup shapes, **zero mid-serve JIT** (C=1…16 + sampler combos pre-compiled) |
+| Cold boot to serving | **~5 min**, ~110-class warmup shapes, **no mid-serve JIT** (shape ladder + C=1…32 + sampler combos pre-compiled; the chunk-geometry kernel needs no coverage — the geospec patch compiles it once for all prefill geometries) |
 | Output integrity | temp-0 exact repeats byte-identical (incl. through the SP collectives); strict JSON clean; mixed battery 0 errors |
 | Host headroom | **~5–10 GiB/box** steady at gmu 0.80 with a text-support-only co-tenant load; see below |
 
@@ -202,6 +205,86 @@ alone is inert with all-default priorities); `tools/fairness-probe.py`
 is the instrument — together the two patches are interactive immunity:
 running streams protected by cadence, arriving requests protected by
 admission.
+
+### The TP3 wedge, closed — reliability posture
+
+The failure mode this stack cannot afford: a rank hits a Triton JIT
+compilation **mid-serve** inside a TP collective, the collective waits
+forever (this build's all-reduce backend sits outside the torch NCCL
+watchdog), and the lane hard-wedges while `/health` keeps answering
+200 — every in-flight request hangs. The first diagnosis blamed an
+uncovered batch shape and answered with warmup arms; the wedge came
+back. The real root cause: the prefill **chunk-metadata kernel is
+specialized on the residue classes of its chunk-bound integers**
+(Triton bakes value 1 as a constexpr, hints divisibility on multiples
+of 16, and keys pointers by 16-byte alignment) — and those bounds are
+arbitrary integers set by packed context depth × concurrency. Real
+traffic mints new kernel-cache keys forever; no warmup can enumerate
+that variant space.
+
+`patches/hotfix-dsv4-prefill-chunk-geospec.py` closes the class at the
+engine level: `do_not_specialize` on the two geometry ints plus
+`do_not_specialize_on_alignment` on the sliced seq-lens pointer —
+codegen-only, outputs bit-identical, one compiled variant for every
+geometry (compiled during the stock boot warmup). Verified on a 3-box
+lane: zero mid-serve JIT of the kernel across boot, the two concurrent
+~52K-token prefill trigger, a full replay pass, and an extended
+post-replay idle soak; a fixed set of deterministic cache variants per
+box with zero growth under every later gate; correctness battery and
+throughput band unchanged — and the first live use on the patched
+engine, a very large cold context, prefilled and streamed correctly
+with zero mid-serve JIT.
+
+Around that close, the posture hardened on three more axes:
+
+- **The warmup's concurrent deep-prefill arm now actually runs.** Its
+  ~52K-token prompt bodies exceeded the kernel's per-argument size
+  limit, so every arm died silently before the request fired (the
+  error text landed where nothing read it). Bodies are staged as files
+  (`-d @file`), making arm size independent of argv limits, and the
+  arm tally is now self-counting — every scheduled request registers
+  itself, so the summary can never disagree with what ran (a manual
+  count once masked the swallowed failures behind a cosmetic
+  mismatch).
+- **The heartbeat watchdog is probe-confirmed.** On this build a
+  healthy idle engine goes log-silent (dormant), so pure "no
+  iteration lines" detection false-fired on every quiet lane. Stage 1
+  is still the silence trigger; stage 2 is a tiny 1-token completion —
+  a dormant engine answers in a fraction of a second, a wedged one
+  hangs it — and only a failed probe recovers the lane. Missing
+  evidence (an unresolvable model id) proves neither state and never
+  triggers recovery; an absent container is never probed and never
+  auto-booted from cold. The timestamped state file stays the
+  watchdog's own liveness signal.
+- **Warm-prefix replay: once per boot, after the warmup settles —
+  never on a schedule.** A background replay's concurrent deep
+  prefills were the historical wedge trigger (minting the geometry
+  keys above), and the geospec close is verified under exactly that
+  workload — a full replay pass plus an extended post-replay idle
+  soak, zero mid-serve JIT — so replaying prefixes at boot is safe
+  again on this stack. The pattern: replay each client's stable
+  captured prefix once, after the shape warmup settles — from your
+  own boot script or on demand; never on a schedule, so no cron. A
+  replay gate you wire yourself keeps the verified shape:
+  single-instance lock, bounded time budget, low priority so live
+  traffic always outranks it (`DSPARK_BOOT_PREFIX_WARM` is the knob
+  this profile reserves for it; the pinned upstream launcher ships
+  none — with no gate wired, the key is simply unread). The on-demand
+  loop below is the reference implementation, run with the idle-gate
+  discipline in mind:
+
+```sh
+# on demand — re-POST each client's stable prefix once, watched:
+for f in prefixes/*.json; do
+  curl -s http://127.0.0.1:8000/v1/chat/completions \
+    -H 'Content-Type: application/json' -d @"$f" >/dev/null
+done
+```
+
+One belt beyond the boxes: if clients sit behind a streaming proxy,
+give it an inactivity deadline — a TCP-alive-but-silent upstream
+should become a prompt transport failure, not an open stream
+heartbeating a wedged engine.
 
 ## The methodology (this recipe's other product)
 
@@ -292,8 +375,10 @@ records what each rule cost to learn.
   the *first* deep prefill after boot pays the JIT premium (pre-warm or
   label). Warm-prefix replay is the felt-speed lever: keep client system
   prompts and repo context stable — a replayed ~24K prefix answers ~14×
-  faster (effective rate). After any boot, replay your clients' prefixes
-  before judging speed, and never restart the lane casually: the boot
+  faster (effective rate). Replay captured client prefixes once per
+  boot, after the warmup settles — from your own boot script or the
+  on-demand pattern in the reliability section — and never put replay
+  on a cron-style schedule. Never restart the lane casually: the boot
   wipes the prefix cache for every client at once.
 - **Exercise your real depth before trusting it.** Recall here is
   verified to ~950K (instructed, word-exact); the pool math holds ~4.1
@@ -367,6 +452,7 @@ patched V4.1 lanes, and neither does ours.
 | SP prefill | this repo's `patches/apply_sp_prefill.py`, stage 3, chained after the pad kit |
 | Decode fairness | this repo's `patches/apply_prefill_decode_interval.py` at N=2 (`DSPARK_PREFILL_DECODE_INTERVAL`; 0/unset = not applied) |
 | Interactive admission | this repo's `patches/apply_interactive_admission.py` (`DSPARK_INTERACTIVE_ADMISSION=1` + `--scheduling-policy priority` on the serve line; 0/unset = not applied) |
+| Chunk-geometry JIT close | this repo's `patches/hotfix-dsv4-prefill-chunk-geospec.py` (`do_not_specialize` on the chunk-metadata kernel's geometry ints — one variant for all prefill geometries; skip with `DSPARK_SKIP_PREFILL_CHUNK_GEOSPEC_HOTFIX=1`) |
 | Spec decode | DSpark k=5 probabilistic (trained in-checkpoint drafter) |
 | KV | image-default `nvfp4_ds_mla` (fp8 measured and rejected — rung 10) |
 
@@ -468,6 +554,26 @@ Full detail per rung in `docs/FIXLOG.md`.
     (`tools/fairness-probe.py`'s minutes-class chat wall with free slots
     is exactly this signature).
 
+22. **Negative request priority starves the request itself**: on an
+    idle engine, a ten-token prompt sent with `priority: -1000` waited
+    tens of seconds before serving — sub-second at default priority
+    (negative values are not "high priority" here; don't reason from
+    the sign). Bulk and warm-up scripts need no priority tricks: the interactive-
+    admission patch (landmine 21) already bounds bulk prefill's impact
+    on interactive streams.
+23. **A TP3 wedge presents as healthy**: the API keeps answering 200
+    while every request hangs — check the engine's 10 s iteration lines,
+    not /health. The known cause was a mid-serve Triton JIT stalling a
+    rank inside a TP collective forever on this stack's PYNCCL backend:
+    the chunk-metadata kernel specializes on the residue classes of its
+    chunk-bound integers, an unbounded variant space no warmup can
+    enumerate. The geospec patch (rung 39) is the permanent close — one
+    compiled variant for every geometry; keep the warmup for the
+    enumerable shape classes, and run the probe-confirmed heartbeat
+    watchdog (rungs 38–40) so anything unknown self-heals in minutes
+    instead of hanging your users; monitor the watchdog's state file
+    for the double-failure case.
+
 ## Repo layout
 
 - `config/cluster.env` — the serving profile of record (every pin +
@@ -481,6 +587,10 @@ Full detail per rung in `docs/FIXLOG.md`.
   admission applier: size-inferred classes + chunk-boundary yield +
   the waiting-interactive budget guard (env-gated, idempotent,
   anchor-enforced ordering after the deferral applier)
+- `patches/hotfix-dsv4-prefill-chunk-geospec.py` — the chunk-geometry
+  JIT close: `do_not_specialize` on the prefill chunk-metadata kernel's
+  geometry ints, one compiled variant for every geometry (env-gated,
+  idempotent, fail-closed — the TP-wedge root-cause fix)
 - `patches/README.md` — stage semantics, chaining, engineering
   constraints, credits
 - `tools/needle-probe.py` — the instructed-recall ladder + vision fence
@@ -495,8 +605,15 @@ Full detail per rung in `docs/FIXLOG.md`.
 - `tools/mixed-battery.py` — the mixed-surface acceptance battery
   (interactive + chat + vision + co-tenant legs, memory floor)
 - `tools/boot-shape-warmup.sh` — boot-time shape/JIT warmup
-  (~95 shapes, tokenize-gated ladder, sampler-combo postcondition)
-- `docs/FIXLOG.md` — 36 rungs, four ladders, including the retractions
+  (~110-class shapes through C=32, tokenize-gated ladder, sampler-combo
+  postcondition, a concurrent deep-prefill pair with file-staged
+  bodies and a self-counting tally)
+- `tools/engine-heartbeat-watchdog.sh` — TP3 deadlock self-healer,
+  probe-confirmed: a silence trigger plus a 1-token confirmation probe
+  (healthy idle dormancy never false-fires) detects the wedge
+  signature (API alive + silent engine heartbeat) and recovers the
+  lane unattended (rungs 38–40)
+- `docs/FIXLOG.md` — 40 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
 - `.gitignore` — keeps logs and Python caches out of the tree
@@ -514,7 +631,10 @@ Full detail per rung in `docs/FIXLOG.md`.
   pins nothing; the true lever (environmental boot state) is unpinned.
 - **Upstream watch**: the pinned image line (v0.1.1 era) — the digest
   pin plus the applier's fail-closed anchors make any drift loud;
-  re-pin deliberately.
+  re-pin deliberately. When an image of this line ships the
+  chunk-metadata specialization fix engine-side, the geospec applier
+  becomes redundant — its anchor refuses loudly on a diverged tree, so
+  check its `--status` after any re-pin.
 - **Multi-hour soak**: community reports on this image family include
   garble-class issues under sustained spec-decode load; our batteries
   and shorter soaks are clean, sustained windows are unproven — run one
@@ -553,5 +673,7 @@ the V4.0-vision tree (stages 1–3, the documented stage-4 variant, and
 the plain-ints/aux-stream engineering constraints); the instructed-recall
 instrument and the re-adjudication methodology; the cold/warm,
 solo/mixed, and same-boot labeling rules; the mixed battery with live
-co-tenants; the boot-lottery advisory check; the measured landmine
-ledger. Scripts: MIT (see `LICENSE`); upstream licenses apply.
+co-tenants; the boot-lottery advisory check; the chunk-geometry
+specialization close and the probe-confirmed watchdog posture; the
+measured landmine ledger. Scripts: MIT (see `LICENSE`); upstream
+licenses apply.
