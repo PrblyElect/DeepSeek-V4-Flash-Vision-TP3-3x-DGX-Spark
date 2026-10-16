@@ -135,7 +135,10 @@ idle-gate in §2 passes):
    envelope probe** when the 1M window matters to you (~15 min wall;
    ~1K tok/s class at that depth).
 3. **Vision fence**: single-image TTFT (~0.7 s class) and the 8-image
-   cap — all eight left-colors named in order at TP=3.
+   default cap — all eight left-colors named in order at TP=3. The cap
+   is the engine's mm-limit flag, not the model: raising it and
+   re-running the same fence with the color list extended to higher
+   counts passed in order (128 small-image, 32 photo-scale — rung 37).
 4. **Aggregate sweep** (`agg-sweep.py`) at 1/4/16/32 in both prompt
    classes, corruption spot-check green after.
 5. **Mixed-tax probe** (`mixed-tax-probe.py`, idle-gated, on the head
