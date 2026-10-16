@@ -1,10 +1,11 @@
-# patches/ — the SP-prefill, deferral-cadence, and admission appliers
+# patches/ — the SP-prefill, deferral-cadence, admission, and geospec appliers
 
-Three appliers, all house-idiom appliers (not diffs), all:
+Four appliers, all house-idiom appliers (not diffs), all:
 
 - **Marker-guarded and idempotent** — every edit lands inside a marked
-  block; re-running is a no-op (`--status` on the deferral and
-  admission appliers reports without changing).
+  block; re-running is a no-op (`--status` on the deferral, admission,
+  and geospec appliers reports without changing; `--check`/`--revert`
+  exist only on the SP-prefill applier).
 - **Fail-closed anchors** — every edit aborts unless its anchor text
   occurs exactly once in the expected file, so a diverged image tree
   can never be half-patched.
@@ -183,6 +184,46 @@ python3 apply_interactive_admission.py            # idempotent apply
 Version note: a previous-version mark on a reused container filesystem
 is a hard error by design — recreate the containers (the documented
 boot path) rather than restarting them.
+
+## 4. `hotfix-dsv4-prefill-chunk-geospec.py` — one compiled variant for every prefill chunk geometry
+
+The permanent close of the TP-wedge class (FIXLOG rung 39; rung 38
+recorded the wedge, this closes the root cause). The engine's prefill
+chunk-metadata Triton kernel is launched with Python-int chunk bounds
+whose values are arbitrary (they depend on packed context depth ×
+concurrency), and Triton specializes integer arguments by residue
+class — value 1 bakes a constexpr, multiples of 16 earn a divisibility
+hint — plus a 16-byte-alignment key per pointer. Real traffic
+therefore mints new kernel-cache keys mid-serve, and the first
+compile that lands inside a TP collective stalls the whole lane with
+`/health` still green. No request-side warmup can enumerate that
+variant space; rung 38's warmup arms only papered over the classes
+they happened to hit.
+
+The applier adds `do_not_specialize` on the two geometry ints and
+`do_not_specialize_on_alignment` on the sliced seq-lens pointer (the
+same pattern this vLLM already uses on another kernel) — a
+codegen-only change, outputs bit-identical. One variant then serves
+every geometry and compiles during the existing boot warmup.
+
+**Applying** — runs inside the container against the image's vLLM
+tree (fail-closed: refuses unless the anchor decorator matches
+exactly once and the pinned kwargs still name real parameters):
+
+```sh
+python3 hotfix-dsv4-prefill-chunk-geospec.py --status   # APPLIED / NOT APPLIED
+python3 hotfix-dsv4-prefill-chunk-geospec.py            # idempotent apply
+```
+
+For automatic application, stage it with the other appliers and chain
+it in the entrypoint after the image's own indexer-file hotfixes
+(that file is sha-gated on the same source). **One env knob:**
+`DSPARK_SKIP_PREFILL_CHUNK_GEOSPEC_HOTFIX=1` skips the invocation
+entirely (rollback lever); unset = applied. Verified on a 3-box lane:
+zero mid-serve JIT of the kernel across boot, the concurrent
+deep-prefill trigger, and a full replay pass; a fixed set of
+deterministic cache variants per box with zero growth under all
+later gates; correctness battery and throughput band unchanged.
 
 **Instrument:** `tools/fairness-probe.py` (this repo): two fresh-nonce
 bulk prefills fill the cap, then a small chat and a parallel decode
