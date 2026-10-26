@@ -19,14 +19,14 @@ DGX Sparks (GB10) on a CX-7 RoCE triangle, with DSpark k=5 speculative
 decoding and a ported sequence-parallel prefill path. As far as we can
 find this is the **first TP=3 serving of this checkpoint with the vision
 tower live**. Warm numbers: **~99 tok/s** single-stream on code-class
-streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.3M-token
-KV pool ≈ 4.1 simultaneous full-1M-context sessions**, instructed-recall
+streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.0M-token
+KV pool ≈ 3.8 simultaneous full-1M-context sessions**, instructed-recall
 verified **word-exact to ~950K tokens**, 8/8 images per request at
 ~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
 Boot is ~5 min with ~110-class pre-warmed shapes (C=1–32 + sampler combos),
 and the chunk-geometry JIT wedge class is **closed at the engine level** —
 one compiled variant for every prefill geometry, no mid-serve JIT. The
-defaults leave **~5–10 GiB/box of headroom for co-tenant services** — that
+defaults leave **~4–9 GiB/box of headroom for co-tenant services** — that
 is part of the spec, not a leftover (**Headroom by design** below).
 
 Just as valuable as the profile is the **measurement methodology** this
@@ -61,7 +61,7 @@ engagement switch) · **prefill-decode deferral cadence N=2** (decode
 fairness beside deep prefills — see below) · **interactive admission
 ON** (arriving chats protected mid-bulk; requires the
 `--scheduling-policy priority` serve flag — see below) · SP stage 3 ·
-gmu 0.80 · 1M context. Every axis carries a measured verdict or a recorded
+gmu 0.78 · 1M context. Every axis carries a measured verdict or a recorded
 blocker (`docs/FIXLOG.md`).
 
 The recipe is checkpoint-agnostic within the Vision-Exp family: serve
@@ -122,13 +122,13 @@ labeling discipline of `docs/VALIDATION.md`.
 | Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound; acceptance ladder in the class row below) |
 | Decode by generation class | accepted/drafted at k=5, per measured class: **~9/10** count/code · **~2/3** schema-bound tool calls · **~40%** reasoning (thinking on) · **~1/4** free prose — per-step token yield scales with (1 + 5 × acceptance) (wall-clock adds each class's step cost), so tool-heavy agentic traffic with thinking on runs the **~55–76 tok/s** class, not the count-class headline (speculative decoding stays active with thinking on) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
-| KV pool | **~4.3M tokens ≈ 4.1 full-1M sessions** at gmu 0.80 (boot jitter ±10%; the pool is the min across ranks) |
+| KV pool | **~4.0M tokens ≈ 3.8 full-1M sessions** at gmu 0.78 (the session count is that pool divided by the 1,048,576-token window — a ratio of the same measurement, not a second one; boot jitter ±10%; the pool is the min across ranks) |
 | Long-context recall | instructed needle **word-exact to ~950K tokens** (~1K tok/s prefill at that depth); 1M is configured and pool-proven |
 | Vision | **8/8 images per request, in order**, at TP=3 · **~0.7 s image-TTFT** · multi-image color/position correct · the per-request image cap is the engine flag, not the model (validated upward to 128 small-image / 32 photo-scale — rung 37) |
 | Warm-prefix replay | **~14× effective TTFT** (a stable ~24K prefix replays at ~2 s wall vs a cold effective rate ~14× slower) |
 | Cold boot to serving | **~5 min**, ~110-class warmup shapes, **no mid-serve JIT** (shape ladder + C=1…32 + sampler combos pre-compiled; the chunk-geometry kernel needs no coverage — the geospec patch compiles it once for all prefill geometries) |
 | Output integrity | temp-0 exact repeats byte-identical (incl. through the SP collectives); strict JSON clean; mixed battery 0 errors |
-| Host headroom | **~5–10 GiB/box** steady at gmu 0.80 with a text-support-only co-tenant load; see below |
+| Host headroom | **~4–9 GiB/box** at gmu 0.78 (per-box floors 7 / 9 / 4 GiB — the rung's "tenant-safe limit"); the rung was gated on deep-prefill traffic (a 2×~420K needle battery), not a text-support load; see below |
 
 ### Headroom by design — the profile shares the boxes
 
@@ -136,13 +136,21 @@ This is a working-stack recipe, not a whole-box benchmark. The shipped
 defaults sit deliberately below the measured ceilings so the same three
 Sparks keep carrying the rest of a live stack — embedders, document
 processing, chat frontends. At the shipped gmu the boxes hold
-~5–10 GiB steady with the lane serving, and a several-GiB floor holds
+~4–9 GiB steady with the lane serving, and a several-GiB floor holds
 through a mixed battery with the co-tenant services **live** (the
 acceptance gate's full form runs them in flight — a tenants-skipped run
-is a diagnostic, not a gate). 0.80 assumes text-support-only co-tenants:
-measured with a GPU-side tenant live, it left ~1 GiB on the most-shared
-box — an OOM-under-tenant-burst waiting to fire; don't copy it across
-tenancies. Spend the headroom deliberately; every gmu step in the FIXLOG
+is a diagnostic, not a gate). **gmu 0.78 is the shipped value on a
+unified-memory box:** the GPU reservation and request-side CPU staging
+draw from one pot, so a single very deep prefill (a ~30k tok/s prompt
+burst) can stage ~5 GiB of CPU working set and starve the box while the
+KV pool still reports free capacity — the 0.80 margin was too thin for
+that class (recurring kernel-OOM events, each with a different trigger
+and the same constant: headroom, not trigger; see landmine 15). 0.78
+restores a measured floor (a 2×~420K needle battery held a ~6 GiB trough
+with zero OOM) and keeps the pool at ~4.0M. **Rule: no GPU-side tenants
+on a serving box at 0.80 — TP3 means every box carries a rank, so
+there is no free box to disperse a tenant to; drop to 0.78 if one is
+live.** Spend the headroom deliberately; every gmu step in the FIXLOG
 records what it buys.
 
 ### Not tested / not claimed
@@ -381,7 +389,7 @@ records what each rule cost to learn.
   on a cron-style schedule. Never restart the lane casually: the boot
   wipes the prefix cache for every client at once.
 - **Exercise your real depth before trusting it.** Recall here is
-  verified to ~950K (instructed, word-exact); the pool math holds ~4.1
+  verified to ~950K (instructed, word-exact); the pool math holds ~3.8
   full windows. If you serve near the envelope, run the ~950K probe
   yourself — it is one command and ~15 min.
 - **Thinking mode** defaults high on this family's reasoning parser:
@@ -423,7 +431,7 @@ records what each rule cost to learn.
   checkpoint doesn't need.
 
 Net: three boxes buy **native vision at TP=3 with 32-way aggregate
-headroom, ~4.1 full-1M sessions, and verified ~950K recall**. Prefill
+headroom, ~3.8 full-1M sessions, and verified ~950K recall**. Prefill
 remains the frontier — nobody's 3-box V4.0 prefill matches the best
 patched V4.1 lanes, and neither does ours.
 
@@ -503,9 +511,14 @@ Full detail per rung in `docs/FIXLOG.md`.
     deep prefills engage SP only as full ~8K chunks (adaptive chunk ON).
     The engine's stage/split log lines are the engagement proof; the
     mixed-axis alternatives were measured and rejected.
-15. **gmu 0.80 assumes text-support-only co-tenants** — with a GPU-side
-    tenant live it left a ~1 GiB floor on the most-shared box; don't
-    copy it across tenancies.
+15. **gmu 0.78 is the shipped value; 0.80 is a co-tenant-only gamble.**
+    On a unified-memory box one deep prefill's CPU staging shares the
+    same pot as the GPU reservation — a single ~30k tok/s prompt burst
+    can starve a box while the KV pool still reports free capacity
+    (recurring kernel-OOM events, each with a different trigger; the
+    constant is headroom, not trigger). The rule: no GPU-side tenants on
+    a serving box at 0.80; at 0.78 a measured 2×~420K battery held a
+    ~6 GiB trough with zero OOM.
 16. **Boot hygiene**: workers first, head last; fresh `docker run` never
     `restart`; one GPU owner per box; drop caches every rank; a NIC
     stuck slow or a GPU latched below clock is fixed by a cold power
@@ -611,9 +624,15 @@ Full detail per rung in `docs/FIXLOG.md`.
 - `tools/engine-heartbeat-watchdog.sh` — TP3 deadlock self-healer,
   probe-confirmed: a silence trigger plus a 1-token confirmation probe
   (healthy idle dormancy never false-fires) detects the wedge
-  signature (API alive + silent engine heartbeat) and recovers the
-  lane unattended (rungs 38–40)
-- `docs/FIXLOG.md` — 40 rungs, four ladders, including the retractions
+  signature (API alive + silent engine heartbeat), a SPIN-PREFILL
+  detector catches the engine-responsive variant (a request stuck
+  re-processing a prompt: running > 0 with near-zero generation,
+  sustained), and the recovery path captures py-spy stacks before
+  teardown (the root-cause instrument) — all unattended (the wedge-recovery
+  ladder is in `docs/FIXLOG.md`; the spin-prefill detector and the py-spy
+  wedge-stack capture have no published rung);
+  the default engine port is :8000 (the recipe's serving port)
+- `docs/FIXLOG.md` — 41 rungs, four ladders, including the retractions
 - `docs/VALIDATION.md` — the measurement methodology + gate battery
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
 - `.gitignore` — keeps logs and Python caches out of the tree
