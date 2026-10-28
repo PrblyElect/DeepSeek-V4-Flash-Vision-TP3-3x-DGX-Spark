@@ -19,14 +19,14 @@ DGX Sparks (GB10) on a CX-7 RoCE triangle, with DSpark k=5 speculative
 decoding and a ported sequence-parallel prefill path. As far as we can
 find this is the **first TP=3 serving of this checkpoint with the vision
 tower live**. Warm numbers: **~99 tok/s** single-stream on code-class
-streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.0M-token
+streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.1M-token
 KV pool ≈ 3.8 simultaneous full-1M-context sessions**, instructed-recall
 verified **word-exact to ~950K tokens**, 8/8 images per request at
 ~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
 Boot is ~5 min with ~110-class pre-warmed shapes (C=1–32 + sampler combos),
 and the chunk-geometry JIT wedge class is **closed at the engine level** —
 one compiled variant for every prefill geometry, no mid-serve JIT. The
-defaults leave **~4–9 GiB/box of headroom for co-tenant services** — that
+defaults leave **~8–11 GiB/box of headroom** (tenant-free; the shipped 0.80 assumes no GPU/CPU tenants beside the ranks — with tenants, ship 0.78) — that
 is part of the spec, not a leftover (**Headroom by design** below).
 
 Just as valuable as the profile is the **measurement methodology** this
@@ -61,7 +61,7 @@ engagement switch) · **prefill-decode deferral cadence N=2** (decode
 fairness beside deep prefills — see below) · **interactive admission
 ON** (arriving chats protected mid-bulk; requires the
 `--scheduling-policy priority` serve flag — see below) · SP stage 3 ·
-gmu 0.78 · 1M context. Every axis carries a measured verdict or a recorded
+gmu 0.80 (tenant-free) · 1M context. Every axis carries a measured verdict or a recorded
 blocker (`docs/FIXLOG.md`).
 
 The recipe is checkpoint-agnostic within the Vision-Exp family: serve
@@ -122,13 +122,13 @@ labeling discipline of `docs/VALIDATION.md`.
 | Single-stream decode | **~99 tok/s** count/code-class · ~35 free prose (draft-acceptance-bound; acceptance ladder in the class row below) |
 | Decode by generation class | accepted/drafted at k=5, per measured class: **~9/10** count/code · **~2/3** schema-bound tool calls · **~40%** reasoning (thinking on) · **~1/4** free prose — per-step token yield scales with (1 + 5 × acceptance) (wall-clock adds each class's step cost), so tool-heavy agentic traffic with thinking on runs the **~55–76 tok/s** class, not the count-class headline (speculative decoding stays active with thinking on) |
 | Aggregate decode | **~1K tok/s @ 32-way** count-class (~720 @ 16) · ~230 @ 32 / ~180 @ 16 prose |
-| KV pool | **~4.0M tokens ≈ 3.8 full-1M sessions** at gmu 0.78 (the session count is that pool divided by the 1,048,576-token window — a ratio of the same measurement, not a second one; boot jitter ±10%; the pool is the min across ranks) |
+| KV pool | **~4.1M tokens ≈ 3.9 full-1M sessions** at gmu 0.80 tenant-free (measured 4,144,322; the session count is that pool divided by the 1,048,576-token window — a ratio of the same measurement, not a second one; boot jitter ±10%; the pool is the min across ranks) |
 | Long-context recall | instructed needle **word-exact to ~950K tokens** (~1K tok/s prefill at that depth); 1M is configured and pool-proven |
 | Vision | **8/8 images per request, in order**, at TP=3 · **~0.7 s image-TTFT** · multi-image color/position correct · the per-request image cap is the engine flag, not the model (validated upward to 128 small-image / 32 photo-scale — rung 37) |
 | Warm-prefix replay | **~14× effective TTFT** (a stable ~24K prefix replays at ~2 s wall vs a cold effective rate ~14× slower) |
 | Cold boot to serving | **~5 min**, ~110-class warmup shapes, **no mid-serve JIT** (shape ladder + C=1…32 + sampler combos pre-compiled; the chunk-geometry kernel needs no coverage — the geospec patch compiles it once for all prefill geometries) |
 | Output integrity | temp-0 exact repeats byte-identical (incl. through the SP collectives); strict JSON clean; mixed battery 0 errors |
-| Host headroom | **~4–9 GiB/box** at gmu 0.78 (per-box floors 7 / 9 / 4 GiB — the rung's "tenant-safe limit"); the rung was gated on deep-prefill traffic (a 2×~420K needle battery), not a text-support load; see below |
+| Host headroom | **~8–11 GiB/box** at gmu 0.80 tenant-free (idle floors 7.7–8.9 GiB; deep-prefill floors 9.0–10.8 GiB under a 2×~420K needle battery; a ~742K full-context recall held 8.7+ GiB) — the precondition is NO GPU-side tenants on the serving boxes; with tenants the shipped value is 0.78 |
 
 ### Headroom by design — the profile shares the boxes
 
