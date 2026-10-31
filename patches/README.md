@@ -9,7 +9,9 @@ Four appliers, all house-idiom appliers (not diffs), all:
 - **Fail-closed anchors** — every edit aborts unless its anchor text
   occurs exactly once in the expected file, so a diverged image tree
   can never be half-patched.
-- `py_compile` runs inside the apply on every edited file.
+- a syntax check runs inside the apply on every edited file
+  (`py_compile` in the SP applier; `compile()` / `ast.parse()` in the
+  others).
 
 ## 1. `apply_sp_prefill.py` — sequence-parallel prefill at TP=3
 

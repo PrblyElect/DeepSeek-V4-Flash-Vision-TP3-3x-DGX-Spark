@@ -94,6 +94,9 @@ def patch_text(source: str) -> tuple[str, str]:
 
 
 def main() -> int:
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__.strip() if __doc__ else __file__)
+        return 0
     if len(sys.argv) > 1 and sys.argv[1] == "--status":
         status_src = P.read_text() if P.is_file() else ""
         print(

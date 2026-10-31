@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-Note: this repository ships no verbatim upstream source files. The SP-prefill
-applier (patches/apply_sp_prefill.py) is original tooling that INJECTS code
-derived from Apache-2.0 vLLM-lineage modules into your installed vLLM tree at
-apply time; the injected module carries its upstream SPDX-License-Identifier:
-Apache-2.0 header, and the edited files in your tree remain under their
-upstream licenses. The MIT license above covers the scripts and documentation
-in this repository.

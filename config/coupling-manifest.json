@@ -1,0 +1,144 @@
+{
+  "manifest_version": 1,
+  "description": "Coupling contract for the serving profile: which pinned upstream source carries which profile variable, and which variables this recipe owns. tools/coupling-guard.py checks this contract against a pinned checkout, a pinned archive, or the live upstream. A search_files entry is written as \"./<path>\", meaning \"relative to the upstream checkout root\".",
+  "profile": "config/cluster.env",
+  "recipe_sources": [
+    "patches",
+    "tools"
+  ],
+  "upstreams": [
+    {
+      "key": "compose",
+      "repo": "MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark",
+      "rev": "97e8733238f81f5fdc44b241f8996a7858825744",
+      "role": "compose, launcher and env shape",
+      "license": "MIT",
+      "search_files": [
+        "./.env.dspark.example",
+        "./docker-compose.dspark.yml",
+        "./start-deepseek-v4-flash-dspark.sh",
+        "./patches/dsv4_tp_pad.py",
+        "./recipe/overlay/vllm/envs.py",
+        "./docs/ENVS.md"
+      ]
+    },
+    {
+      "key": "padkit",
+      "repo": "localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark",
+      "rev": "496c6a146a383f1b7c3f5991f4f1930091420720",
+      "role": "TP=3 attention-group pad kit",
+      "license": "MIT",
+      "search_files": [
+        "./config/env.dspark.tp3.example",
+        "./config/compose.tp3.fragment.yml",
+        "./scripts/make_3node.sh",
+        "./patches/dsv4_tp_pad.py",
+        "./patches/tp3/apply_tp3_patch.py",
+        "./docs/CHANGES-REQUIRED.md",
+        "./README.md"
+      ]
+    }
+  ],
+  "classes": {
+    "upstream_compose": {
+      "carrier": "compose",
+      "vars": [
+        "DSPARK_MODEL_OFFICIAL",
+        "DSPARK_REVISION",
+        "ABLITERATED",
+        "DSPARK_VLLM_IMAGE",
+        "TP_SIZE",
+        "NNODES",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "WORKER_HOST",
+        "WORKER2_HOST",
+        "NCCL_IB_HCA",
+        "NCCL_IB_GID_INDEX",
+        "NCCL_IB_ROCE_VERSION_NUM",
+        "NCCL_CROSS_NIC",
+        "NCCL_DEBUG",
+        "VLLM_DSV4_TP_PAD",
+        "TP3_PATCH_DIR",
+        "HF_HUB_OFFLINE",
+        "DSPARK_ENCODING_FILE",
+        "PROJECT_NAME",
+        "VLLM_HOST",
+        "VLLM_PORT",
+        "SERVED_MODEL_NAME",
+        "DEFAULT_THINKING",
+        "VLLM_FORCE_AOT_LOAD",
+        "MAX_MODEL_LEN",
+        "MAX_NUM_SEQS",
+        "MAX_NUM_BATCHED_TOKENS",
+        "LONG_PREFILL_TOKEN_THRESHOLD",
+        "DSPARK_MAX_INFLIGHT_PREFILLS",
+        "MTP_NUM_TOKENS",
+        "DSPARK_ENABLE_DSPARK_BLOCK_K",
+        "DSPARK_ENABLE_DSPARK_SWA_PREFIX",
+        "DSPARK_ENABLE_ISSUE136_XGRAMMAR_HOTFIX",
+        "DSPARK_ENABLE_ADAPTIVE_CHUNK",
+        "DSPARK_ENABLE_MXFP4_INDEXER_CACHE",
+        "DSPARK_ENABLE_DEEPGEMM_SM121_ALIAS",
+        "DSPARK_ENABLE_C128A_PREFILL_CACHE",
+        "GPU_MEMORY_UTILIZATION_TEXT"
+      ]
+    },
+    "upstream_padkit": {
+      "carrier": "padkit",
+      "vars": [
+        "TP_SIZE",
+        "NNODES",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "WORKER2_HOST",
+        "NCCL_IB_HCA",
+        "VLLM_DSV4_TP_PAD",
+        "TP3_PATCH_DIR",
+        "PROJECT_NAME",
+        "MAX_MODEL_LEN",
+        "MAX_NUM_SEQS",
+        "MAX_NUM_BATCHED_TOKENS",
+        "MTP_NUM_TOKENS"
+      ]
+    },
+    "recipe_owned": {
+      "carrier": "recipe",
+      "vars": [
+        "DSV4V_PREFILL_SP_STAGES",
+        "DSV4V_PREFILL_SP_MIN_ROWS",
+        "DSPARK_PREFILL_DECODE_INTERVAL",
+        "DSPARK_INTERACTIVE_ADMISSION",
+        "DSPARK_INTERACTIVE_MAX_PROMPT_TOKENS",
+        "DSPARK_BULK_PRIORITY",
+        "DSPARK_BULK_YIELD_LIMIT"
+      ],
+      "notes": {
+        "DSV4V_PREFILL_SP_STAGES": "read by patches/apply_sp_prefill.py",
+        "DSV4V_PREFILL_SP_MIN_ROWS": "read by patches/apply_sp_prefill.py",
+        "DSPARK_PREFILL_DECODE_INTERVAL": "read by patches/apply_prefill_decode_interval.py",
+        "DSPARK_INTERACTIVE_ADMISSION": "read by patches/apply_interactive_admission.py",
+        "DSPARK_INTERACTIVE_MAX_PROMPT_TOKENS": "read by patches/apply_interactive_admission.py",
+        "DSPARK_BULK_PRIORITY": "read by patches/apply_interactive_admission.py",
+        "DSPARK_BULK_YIELD_LIMIT": "read by patches/apply_interactive_admission.py"
+      }
+    },
+    "reader_library": {
+      "carrier": null,
+      "vars": [
+        "MODEL_NAME",
+        "NCCL_MAX_NCHANNELS",
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN",
+        "CUDA_DEVICE_ORDER",
+        "DSPARK_BOOT_PREFIX_WARM"
+      ],
+      "notes": {
+        "MODEL_NAME": "a profile-local label; the pinned compose upstream publishes SERVED_MODEL_NAME instead, so no pinned upstream carries this name",
+        "NCCL_MAX_NCHANNELS": "absent from the pinned compose upstream's environment block, from its main branch and from its history; a reader-carried knob, which is why the fixlog records that a silently-dropped passthrough reads exactly like a knob that does not help",
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "a library-level hub guard read by the runtime, not by the compose environment block",
+        "CUDA_DEVICE_ORDER": "a documented inert safeguard on this stack (one GPU per rank); keep it only as a latch for a future multi-GPU or compiled model",
+        "DSPARK_BOOT_PREFIX_WARM": "a reserved knob: the pinned upstream launcher ships no replay gate, so the key is simply unread until a boot script wires it"
+      }
+    }
+  }
+}

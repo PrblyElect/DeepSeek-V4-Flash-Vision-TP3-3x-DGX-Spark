@@ -9,7 +9,7 @@ baked in (see docs/VALIDATION.md and the FIXLOG's instrument rungs):
    model's temperature-0 continuation style, not recall: greedy decoding
    sits on a near-tie between echoing the filler and reciting the word,
    and which style wins flips with the nonce and with cache/kernel
-   numerics. We measured uninstructed misses at depth coexisting with
+   numerics. Uninstructed misses at depth were measured coexisting with
    6/6 instructed passes on the same boot, at the same depths, minutes
    apart. The legacy uninstructed corpus is kept ONLY behind --legacy for
    reproducing historical runs, and is labeled as such.

@@ -1,0 +1,33 @@
+# NOTICE
+
+This repository is MIT-licensed (see `LICENSE`) for its own scripts and
+documentation. No verbatim upstream source file is shipped here.
+
+Four appliers under `patches/` rewrite files in the vLLM tree installed on
+the serving box, at apply time, inside the container. The code those
+appliers inject or edit is derived from Apache-2.0 vLLM-lineage modules and
+remains under the Apache License 2.0 — see each file's own header:
+
+- `patches/apply_sp_prefill.py` — injects the Apache-2.0-derived module
+  `models/deepseek_v4/sp_prefill.py` (the injected module carries its
+  upstream `SPDX-License-Identifier: Apache-2.0` header) and edits
+  `models/deepseek_v4/nvidia/model.py`,
+  `model_executor/layers/vocab_parallel_embedding.py`,
+  `model_executor/layers/fused_moe/runner/moe_runner.py`,
+  `models/deepseek_v4/nvidia/ops/o_proj.py`,
+  `models/deepseek_v4/attention.py` and
+  `model_executor/layers/sparse_attn_indexer.py`
+- `patches/apply_interactive_admission.py` — edits
+  `vllm/v1/core/sched/scheduler.py`
+- `patches/apply_prefill_decode_interval.py` — edits
+  `vllm/v1/core/sched/scheduler.py`
+- `patches/hotfix-dsv4-prefill-chunk-geospec.py` — edits
+  `vllm/v1/attention/backends/mla/indexer.py`
+
+Every one of those edits is marker-guarded, idempotent and fail-closed, and
+every edited file in the installed tree stays under its own upstream
+license.
+
+The MIT license in `LICENSE` covers the original scripts and documentation
+in this repository, and does not extend to the upstream-derived code the
+appliers inject.

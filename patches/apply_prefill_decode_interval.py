@@ -71,6 +71,9 @@ import sys
 
 P = Path("/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py")
 MARK = "# [dspark-pdi-hotfix]"
+if "--help" in sys.argv or "-h" in sys.argv:
+    print(__doc__.strip() if __doc__ else __file__)
+    raise SystemExit(0)
 if len(sys.argv) > 1 and sys.argv[1] == "--status":
     status_src = P.read_text() if P.is_file() else ""
     print("dspark pdi (prefill-decode-interval):",

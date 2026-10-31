@@ -70,6 +70,71 @@ validation ran on one such derivative (a rank-1 refusal-direction
 projection build; pick your weights with your eyes open, and re-run the
 refusal/sanity probe on whichever you choose).
 
+## What this recipe owns and what it inherits
+
+The boundary matters, because one of the two halves can change under you
+without an announcement.
+
+**Owned here — in this repository, and yours to re-validate:**
+
+- The four appliers under `patches/` — the sequence-parallel prefill
+  port, the prefill-decode deferral cadence, the interactive-first
+  admission, and the chunk-geometry JIT close. Each is marker-guarded,
+  idempotent and fail-closed against the engine tree it edits.
+- The serving profile of record (`config/cluster.env`) and its measured
+  why.
+- The measurement harness under `tools/`, the gate battery in
+  `docs/VALIDATION.md`, and the coupling preflight that proves the
+  profile and the pinned upstreams still agree.
+- Every number in this README, and the ledger behind it
+  (`docs/FIXLOG.md`) — including the retractions.
+
+**Inherited — from third parties, and not this recipe's to change:**
+
+- The runtime image's **engine tree**. The image is a third-party build;
+  this recipe patches INTO it. **Re-pin the image ⇒ re-validate the
+  patches.** The appliers anchor on upstream markers and refuse loudly on
+  a diverged tree — but a refusal is a stop signal, not a re-validation:
+  run the gate battery again against the new tree before serving on it.
+- The **compose and launcher machinery** and the **TP=3 pad kit**, both
+  from public upstream checkouts, pinned by revision in
+  `config/coupling-manifest.json`. `tools/coupling-guard.py` is the
+  preflight that proves the profile and those revisions still agree —
+  offline against a pinned checkout or archive, or against the live
+  upstream.
+- Two open upstream engine issues, inherited as classes rather than as
+  confirmed behaviour here (below).
+
+### The inherited upstream risks
+
+Two open upstream vLLM issues matter to this stack. Neither is established
+on this checkpoint; both are inherited, and the honest thing is to say
+which is which.
+
+- **Uniform-decode misdispatch**
+  ([upstream issue #53051](https://github.com/vllm-project/vllm/issues/53051)).
+  The engine's uniform-decode shape check is pure arithmetic: when a
+  request's scheduled token count equals `uniform_decode_query_len *
+  num_reqs`, a prefill can be dispatched into the CUDA graph captured for
+  speculative decode. On hybrid models with recurrent-state layers the
+  state write is then skipped and the output is deterministic garbage.
+  The **dispatch class is inherited** — this engine tree has the same
+  shape check, and the DSpark k=5 profile puts the trap length at 6
+  tokens. The **demonstrated consequence is not established for this
+  model**: the issue's reported failure was on a different model family,
+  and this checkpoint is MLA/sparse, so the state-loss behaviour is not
+  shown here either way. `tools/spec-decode-short-prompt-check.py` probes
+  the shape directly (`docs/VALIDATION.md`, gate 2.11).
+- **Long-context decode worker death**
+  ([upstream issue #60860](https://github.com/vllm-project/vllm/issues/60860)).
+  A worker died with an unspecified launch failure during long-context
+  decode with speculative decode — on a **different model, a different
+  engine version and a different parallelism shape**. It is an adjacent
+  inherited risk, not this stack's confirmed behaviour. Treat a
+  mid-decode worker death on this profile as unexplained until the logs
+  say otherwise, and diagnose it forward — the ledger records why that
+  rule exists.
+
 ## Quick start
 
 This repo ships the profile (env), the SP patch layer, the acceptance
@@ -79,7 +144,20 @@ line](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark),
 which provides the compose/launcher machinery — checkout a pinned commit
 and record the rev you validate against.
 
+**There is no one-command bring-up.** This recipe ships the profile, the
+patch layer, the harness and the measured why — not an orchestrator. The
+compose and launcher machinery comes from the upstream checkout you stage
+below, the engine image is a third-party build, and the steps below are
+run by hand, in order.
+
+**`tools/engine-heartbeat-watchdog.sh` is a RECOVERY tool, not a bring-up
+orchestrator.** It watches a serving lane and restarts it when that lane
+wedges. It does not create a lane, stage a checkpoint or launch a first
+boot — running it before you have a lane does nothing for you. (Its
+recovery re-runs the upstream launcher, which re-applies the patches.)
+
 1. Stage the checkpoint on **all three** boxes (identical path):
+
 ```sh
 hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
   --revision 86f746b36186f0e567729a5c06a8c918caba82a9 \
@@ -87,6 +165,7 @@ hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
 # (serving an abliteration derivative instead? stage that repo/revision and
 #  keep any runtime-abliteration flag at 0 — the weights are already ablated)
 ```
+
 2. Stage the [upstream 2-Spark DSpark recipe
    checkout](https://github.com/MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark)
    on all three boxes (pinned to a recorded commit) and the pad kit into
@@ -99,6 +178,7 @@ hf download deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
    boot log must show the NCCL 3-rank banner, the pad lines, and the SP
    stage-3 line before anything else is diagnosed.
 5. Run the gates (`docs/VALIDATION.md` has the full battery):
+
 ```sh
 python3 tools/needle-probe.py --selftest
 python3 tools/needle-probe.py --depths 131072,196608,262144 --nonce fresh1   # ~210K/~320K/~420K instructed ladder
@@ -134,8 +214,8 @@ labeling discipline of `docs/VALIDATION.md`.
 
 This is a working-stack recipe, not a whole-box benchmark. The shipped
 defaults sit deliberately below the measured ceilings so the same three
-Sparks keep carrying the rest of a live stack — embedders, document
-processing, chat frontends. At the shipped gmu the boxes hold
+Sparks keep carrying the rest of a live stack — other applications and
+co-tenant services. At the shipped gmu the boxes hold
 ~4–9 GiB steady with the lane serving, and a several-GiB floor holds
 through a mixed battery with the co-tenant services **live** (the
 acceptance gate's full form runs them in flight — a tenants-skipped run
@@ -263,7 +343,10 @@ Around that close, the posture hardened on three more axes:
   evidence (an unresolvable model id) proves neither state and never
   triggers recovery; an absent container is never probed and never
   auto-booted from cold. The timestamped state file stays the
-  watchdog's own liveness signal.
+  watchdog's own liveness signal. This is a **RECOVERY** tool: it
+  detects and recovers a wedged lane. It is not a bring-up
+  orchestrator, and there is no one-command bring-up in this recipe —
+  see the quick start.
 - **Warm-prefix replay: once per boot, after the warmup settles —
   never on a schedule.** A background replay's concurrent deep
   prefills were the historical wedge trigger (minting the geometry
@@ -304,7 +387,7 @@ Steal them for any long-context serving work:
    question) measures the model's temperature-0 **continuation style**,
    not recall: greedy decoding sits on a near-tie between echoing the
    filler and reciting the word, and the nonce and kernel/cache
-   numerics decide which wins. We measured uninstructed misses at depth
+   numerics decide which wins. Uninstructed misses at depth were measured
    coexisting with 6/6 instructed passes on the same boot — after days
    chasing the phantom "corruption boundary" those misses painted
    (thermal hypotheses, power cycles, allocation shifts; FIXLOG rungs
@@ -410,14 +493,14 @@ records what each rule cost to learn.
 
 - **The pad kit's own text-only 3-Spark recipe** ([localaiguyy,
   above](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark)):
-  ~620 tok/s @ 32-way on the text checkpoint. This lane: **~1K @ 32 with
+  ~620 tok/s @ 32-way on the text checkpoint. This recipe: **~1K @ 32 with
   native vision and a verified 1M window** (channels/seqs/caches ladder
   — FIXLOG), on top of the same pad geometry.
 - **Best published 2-Spark Vision-Exp lane** ([tonyd2wild's
   DSpark/NVFP4-KV
   recipe](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)):
   ~84 tok/s peak single-stream, ~182 @ 6-way, 2.79M pool, TTFT 4.1 s
-  @8K → 29.5 s @100K. This lane: faster single-stream (~99 vs ~84),
+  @8K → 29.5 s @100K. This recipe: faster single-stream (~99 vs ~84),
   ~4× the concurrent-stream ceiling, ~1.5× the pool — for 1.5× the boxes.
 - **V4.1 native TP=3 reference** ([christopher_owen's
   thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438)):
@@ -631,10 +714,24 @@ Full detail per rung in `docs/FIXLOG.md`.
   teardown (the root-cause instrument) — all unattended (the wedge-recovery
   ladder is in `docs/FIXLOG.md`; the spin-prefill detector and the py-spy
   wedge-stack capture have no published rung);
-  the default engine port is :8000 (the recipe's serving port)
-- `docs/FIXLOG.md` — 41 rungs, four ladders, including the retractions
-- `docs/VALIDATION.md` — the measurement methodology + gate battery
+  the default engine port is :8000 (the recipe's serving port). It reaches
+  its serving boxes over ssh, and it is a **RECOVERY tool** — it restarts a
+  wedged lane; it does not bring one up
+- `tools/coupling-guard.py` — the preflight that proves the serving
+  profile and the pinned upstream revisions still agree (offline against a
+  pinned checkout or archive, or `--remote` against the live upstream)
+- `tools/spec-decode-short-prompt-check.py` — the DSpark k=5 short-prompt
+  correctness check: an exact-token prompt built from the engine's own
+  token IDs, the engine's own prompt-token count asserted, and the answer
+  judged by a marker echo plus structural checks
+- `config/coupling-manifest.json` — which pinned upstream carries which
+  profile variable, and which variables this recipe owns itself
+- `docs/FIXLOG.md` — 49 rungs, five ladders, including the retractions
+- `docs/VALIDATION.md` — the executable gate battery + the measurement
+  methodology behind it
 - `LICENSE` — MIT (upstream licenses apply to upstream-derived code)
+- `NOTICE` — the Apache-2.0 declaration for the upstream-derived code the
+  appliers inject into the engine tree
 - `.gitignore` — keeps logs and Python caches out of the tree
 
 ## What's next (roadmap, not needed for correctness)
@@ -665,7 +762,7 @@ Full detail per rung in `docs/FIXLOG.md`.
 ## Credits & prior art
 
 - **localaiguyy** — [the attention-group pad kit](https://github.com/localaiguyy/DeepSeek-V4-Flash-DSpark-3x-DGX-Spark)
-  (MIT): the 8→9 pad geometry this lane stands on, the TP3-shape
+  (MIT): the 8→9 pad geometry this recipe stands on, the TP3-shape
   statement of the capture = seqs × (k+1) sizing rule, and the
   zeroed-sink landmine class.
 - **Anemll** — the `dspark-vllm-gx10` runtime: the DSpark spec-decode
@@ -678,12 +775,12 @@ Full detail per rung in `docs/FIXLOG.md`.
   this profile descends from, and the DS4-on-Spark bug documentation.
 - **tonyd2wild** — the [2-Spark Vision-Exp DSpark/NVFP4-KV
   recipe](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark)
-  we benchmark against, and the origin of the capture = seqs × (k+1)
+  the recipe is benchmarked against, and the origin of the capture = seqs × (k+1)
   sizing rule this recipe states for its own shape.
 - **christopher_owen** — the [V4.1 TP=3 reference
   thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438):
   the prefill-SP patch-series semantics this applier adapts, and the
-  3-Spark numbers we race.
+  3-Spark numbers this recipe races.
 - The companion text-only V4-Flash TP=3 recipe (same authors) — carried
   rules: the MNBT two-truths, the capture cliff, the boot-hygiene set.
 
@@ -694,5 +791,5 @@ instrument and the re-adjudication methodology; the cold/warm,
 solo/mixed, and same-boot labeling rules; the mixed battery with live
 co-tenants; the boot-lottery advisory check; the chunk-geometry
 specialization close and the probe-confirmed watchdog posture; the
-measured landmine ledger. Scripts: MIT (see `LICENSE`); upstream
-licenses apply.
+measured landmine ledger. Scripts: MIT (see `LICENSE` and `NOTICE`);
+upstream licenses apply.

@@ -188,11 +188,26 @@ for t in threads: t.join()
 stop.set(); m.join()
 wall = time.time() - t0
 
+def _stats(values):
+    """(min, mean) for a possibly EMPTY list.
+
+    An unreachable lane produces no samples, and `min()` on an empty list
+    raises. A published tool should degrade the way its sibling does —
+    report the emptiness — not die with a traceback.
+    """
+    if not values:
+        return (float("nan"), float("nan"))
+    return (min(values), statistics.mean(values))
+
+
+_imin, _imean = _stats(interactive_rates)
+_cmean = statistics.mean(chat_rates) if chat_rates else float("nan")
+
 results = [
-    ("interactive-floor", all(r >= INTERACTIVE_FLOOR for r in interactive_rates) and len(interactive_rates) == 8,
-     f"samples={len(interactive_rates)} min={min(interactive_rates):.1f} mean={statistics.mean(interactive_rates):.1f} (floor {INTERACTIVE_FLOOR})"),
+    ("interactive-floor", bool(interactive_rates) and all(r >= INTERACTIVE_FLOOR for r in interactive_rates) and len(interactive_rates) == 8,
+     f"samples={len(interactive_rates)} min={_imin:.1f} mean={_imean:.1f} (floor {INTERACTIVE_FLOOR})"),
     ("chat-healthy", len(chat_rates) == 48 and statistics.mean(chat_rates) >= 3.0,
-     f"samples={len(chat_rates)} mean={statistics.mean(chat_rates):.1f}"),
+     f"samples={len(chat_rates)} mean={_cmean:.1f}"),
     ("vision-in-flight", len(vision_ok) == 6 and all(vision_ok),
      f"samples={len(vision_ok)} correct={sum(vision_ok)} (image answers must name both colors)"),
     ("reranker-in-flight", rr_ok or rr_skipped,
@@ -205,7 +220,12 @@ ok = all(r[1] for r in results)
 for name, passed_, detail in results:
     print(f"{'PASS' if passed_ else 'FAIL'} {name}: {detail}")
 if mem_mins[0] < 999999:
-    print(f"memory: min MemAvailable on this box during battery = {mem_mins[0]} MiB")
+    # REPORTED, NOT GATED. This number is printed so a reader can see the
+    # headroom the battery ran against, and it is deliberately not part of
+    # `ok`: there is no floor for it here, and a gate that fires on a
+    # metric nobody chose a threshold for is a gate that cries wolf.
+    print(f"memory: min MemAvailable on this box during battery = {mem_mins[0]} MiB "
+          "(reported, not gated — no floor is defined for it)")
 skipped = rr_skipped or em_skipped
 print(f"wall {wall:.0f}s — MIXED BATTERY {'PASS' if ok else 'FAILURE'}"
       + (" (co-tenant legs skipped — diagnostic run, not the full gate)"
