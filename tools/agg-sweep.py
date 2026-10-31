@@ -133,11 +133,23 @@ def main() -> int:
             results.append(r)
             print(f"level={level:>2} {klass:>5}: agg={r['agg_tok_s']:>7.1f} tok/s "
                   f"({r['total_tokens']} tok / {r['wall_s']}s, errors={r['errors']})")
+    bad = False
     if not args.skip_corruption:
         c = corruption(lane, args.model)
         results.append({"corruption": c})
         print(f"corruption: exact_repeat={c['exact_repeat']} strict_json={c['strict_json']}")
-    bad = any(r.get("errors") for r in results if isinstance(r, dict) and "errors" in r)
+        # The corruption spot-check is part of the VERDICT, not decoration.
+        # A previous version collected it under a "corruption" key while the
+        # verdict only looked at "errors", so the spot-check could fail and
+        # the tool still printed CLEAN and exited 0 -- a gate that could not
+        # fail. Both halves must hold for the sweep to pass.
+        if not (c["exact_repeat"] and c["strict_json"]):
+            bad = True
+            print("corruption spot-check FAILED — exact_repeat and strict_json "
+                  "must both hold")
+    bad = bad or any(
+        r.get("errors") for r in results if isinstance(r, dict) and "errors" in r
+    )
     print("— AGG SWEEP " + ("CLEAN" if not bad else "WITH ERRORS"))
     return 0 if not bad else 1
 

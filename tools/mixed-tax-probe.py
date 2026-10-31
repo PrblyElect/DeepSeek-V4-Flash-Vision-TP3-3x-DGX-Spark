@@ -19,13 +19,31 @@ multi-second worst gaps; with it, ~3x with worst gaps in the ~1 s class
 and p50 near solo speed. Anti-contamination: every deep prefill carries
 a fresh nonce (the prefix cache can never replay a measurement) and the
 engine must be idle-gated before each stage (VALIDATION.md §2). Stdlib
-only; loopback-only endpoints, no redirects; bounded runtime."""
+only; loopback-only endpoints, no redirects; bounded runtime.
+
+The probe is a GATE: it exits non-zero when the deferral knob is off (or
+was not applied), when a stage failed, or when the measured inflation
+crosses the bounds below. The bounds sit between the healthy class (~3x
+mean, ~1 s worst gap) and the broken class (~12x mean, multi-second
+gaps), so a healthy lane is not failed by noise.
+
+Exit codes:
+    0  PASS  the mixed tax stayed inside its bounds
+    1  FAIL  the knob is off, a stage failed, or a bound was crossed
+    2  USAGE bad arguments
+"""
+import argparse
 import json
 import os
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
 
 ENGINE = os.environ.get("MIXED_TAX_LANE", "http://127.0.0.1:8000")
 MODEL = os.environ.get("MIXED_TAX_MODEL", "ds4flash-vision")
@@ -191,29 +209,99 @@ def concurrent(rep):
     return {"during": st_dur, "all": st_all, "pttft": pttft, "pt": pt}
 
 
-print("=== mixed-tax probe (decode beside a deep cold prefill) ===", flush=True)
-print(f"warmup: sacrificial ~{ROWS_WARM * 22 / 1000:.0f}K cold prefill", flush=True)
-Stream(deep_prompt("warm", ROWS_WARM), 8).run()
+def main() -> int:
+    global ENGINE, MODEL
+    ap = argparse.ArgumentParser(
+        prog="mixed-tax-probe.py",
+        description="Measure decode behaviour beside a deep cold prefill (the "
+                    "deferral-cadence instrument).",
+    )
+    ap.add_argument("--lane", default=os.environ.get("MIXED_TAX_LANE",
+                                                     "http://127.0.0.1:8000"),
+                    help="the engine's base URL (or MIXED_TAX_LANE)")
+    ap.add_argument("--model", default=os.environ.get("MIXED_TAX_MODEL",
+                                                      "ds4flash-vision"),
+                    help="the served model name (or MIXED_TAX_MODEL)")
+    ap.add_argument("--max-mean-ratio", type=float, default=8.0,
+                    help="fail if the during-window mean TPOT is more than this "
+                         "many times the solo mean (default: 8 — healthy is ~3x, "
+                         "the knob-off state is ~12x)")
+    ap.add_argument("--max-p50-ratio", type=float, default=6.0,
+                    help="fail if the during-window median TPOT is more than this "
+                         "many times the solo mean (default: 6 — healthy is near 1x)")
+    ap.add_argument("--max-worst-gap-ms", type=float, default=5000.0,
+                    help="fail if the worst during-window gap exceeds this many "
+                         "milliseconds (default: 5000 — healthy is the ~1 s class)")
+    args = ap.parse_args()
 
-solo_dec = [s for s in (solo_decode(r + 1) for r in range(REPS)) if s]
-solo_pre = solo_prefill("solo", ROWS_DEEP)
-conc = [c for c in (concurrent(r + 1) for r in range(REPS)) if c]
+    try:
+        ENGINE = _validate(args.lane)
+    except SystemExit as exc:
+        print(f"usage error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    MODEL = args.model
 
-print("=== summary ===", flush=True)
-if solo_dec and conc:
-    base_mean = min(s["mean_ms"] for s in solo_dec)
-    for i, c in enumerate(conc, 1):
-        d = c["during"]
-        if d and d["n"]:
-            print(f"rep{i}: decode mean ratio = {d['mean_ms'] / base_mean:.1f}x "
-                  f"p50 ratio = {d['p50_ms'] / base_mean:.1f}x "
+    print("=== mixed-tax probe (decode beside a deep cold prefill) ===", flush=True)
+    print(f"warmup: sacrificial ~{ROWS_WARM * 22 / 1000:.0f}K cold prefill", flush=True)
+    Stream(deep_prompt("warm", ROWS_WARM), 8).run()
+
+    solo_dec = [s for s in (solo_decode(r + 1) for r in range(REPS)) if s]
+    solo_pre = solo_prefill("solo", ROWS_DEEP)
+    conc = [c for c in (concurrent(r + 1) for r in range(REPS)) if c]
+
+    print("=== summary ===", flush=True)
+    failures: list[str] = []
+    if len(solo_dec) < REPS:
+        failures.append(f"only {len(solo_dec)}/{REPS} solo decode runs completed")
+    if solo_pre is None:
+        failures.append("the solo deep prefill failed")
+    if len(conc) < REPS:
+        failures.append(f"only {len(conc)}/{REPS} concurrent runs completed")
+
+    if solo_dec and conc:
+        base_mean = min(s["mean_ms"] for s in solo_dec)
+        for i, c in enumerate(conc, 1):
+            d = c["during"]
+            if not (d and d["n"]):
+                failures.append(f"rep{i}: no decode chunks landed inside the "
+                                "prefill window — nothing was measured")
+                continue
+            mean_ratio = d["mean_ms"] / base_mean
+            p50_ratio = d["p50_ms"] / base_mean
+            print(f"rep{i}: decode mean ratio = {mean_ratio:.1f}x "
+                  f"p50 ratio = {p50_ratio:.1f}x "
                   f"(solo mean {base_mean:.0f}ms -> during {d['mean_ms']:.0f}ms; "
                   f"worst {d['max_ms']:.0f}ms)", flush=True)
-    if solo_pre and solo_pre["rate"] and conc:
-        mixed = [c["pt"] / c["pttft"] for c in conc if c["pt"]]
-        if mixed:
-            print(f"prefill mixed tax: solo {solo_pre['rate']:.0f} -> "
-                  f"mixed {sum(mixed) / len(mixed):.0f} tok/s "
-                  f"({100 * (1 - sum(mixed) / len(mixed) / solo_pre['rate']):.0f}% tax)",
-                  flush=True)
-print("=== done ===", flush=True)
+            if mean_ratio > args.max_mean_ratio:
+                failures.append(f"rep{i}: the during-window mean TPOT is "
+                                f"{mean_ratio:.1f}x the solo mean (bound "
+                                f"{args.max_mean_ratio:.1f}x) — the deferral knob "
+                                "is off or was not applied")
+            if p50_ratio > args.max_p50_ratio:
+                failures.append(f"rep{i}: the during-window median TPOT is "
+                                f"{p50_ratio:.1f}x the solo mean (bound "
+                                f"{args.max_p50_ratio:.1f}x)")
+            if d["max_ms"] > args.max_worst_gap_ms:
+                failures.append(f"rep{i}: the worst during-window gap is "
+                                f"{d['max_ms']:.0f}ms (bound "
+                                f"{args.max_worst_gap_ms:.0f}ms)")
+        if solo_pre and solo_pre["rate"] and conc:
+            mixed = [c["pt"] / c["pttft"] for c in conc if c["pt"]]
+            if mixed:
+                print(f"prefill mixed tax: solo {solo_pre['rate']:.0f} -> "
+                      f"mixed {sum(mixed) / len(mixed):.0f} tok/s "
+                      f"({100 * (1 - sum(mixed) / len(mixed) / solo_pre['rate']):.0f}% tax)",
+                      flush=True)
+
+    print()
+    if failures:
+        print("MIXED-TAX PROBE FAIL:")
+        for msg in failures:
+            print(f"  - {msg}")
+        return EXIT_FAIL
+    print("MIXED-TAX PROBE PASS — the mixed tax stayed inside its bounds.")
+    return EXIT_PASS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

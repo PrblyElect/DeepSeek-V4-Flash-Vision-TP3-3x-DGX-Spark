@@ -19,14 +19,25 @@ Gates: 0 errors; interactive streams >= floor (BATTERY_FLOOR, tok/s);
 chat healthy; vision answers name the image's two colors; reranker ranks;
 embedder returns vectors.
 
+Sample counts are DERIVED from the loop constants, so the gate can never
+drift from the work it is gating: 2 interactive workers x 4 rounds = 8
+interactive samples, 8 chat workers x 6 rounds = 48 chat samples, 2 vision
+workers x 3 rounds = 6 vision samples.
+
 Only talks to endpoints you configure (lane defaults to loopback);
 redirects refused.
+
+Exit codes:
+    0  PASS  every gate held
+    1  FAIL  a gate did not hold
+    2  USAGE bad arguments / a non-local endpoint
 """
 import base64
 import json
 import os
 import statistics
 import struct
+import sys
 import threading
 import time
 import urllib.parse
@@ -35,12 +46,45 @@ import zlib
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+
+# The workload shape. The sample counts below are derived from these, so the
+# gate's expectations and the loops that feed it cannot drift apart.
+INTERACTIVE_WORKERS, INTERACTIVE_ROUNDS = 2, 4
+CHAT_WORKERS, CHAT_ROUNDS = 8, 6
+VISION_WORKERS, VISION_ROUNDS = 2, 3
+INTERACTIVE_SAMPLES = INTERACTIVE_WORKERS * INTERACTIVE_ROUNDS   # 8
+CHAT_SAMPLES = CHAT_WORKERS * CHAT_ROUNDS                        # 48
+VISION_SAMPLES = VISION_WORKERS * VISION_ROUNDS                  # 6
+
+USAGE = """usage: mixed-battery.py
+
+Runs the mixed-surface acceptance battery. Configured by environment:
+  BATTERY_LANE       the lane's base URL (default http://127.0.0.1:8000)
+  BATTERY_MODEL      the served model name (default ds4flash-vision)
+  BATTERY_FLOOR      the interactive tok/s floor (default 12.0)
+  BATTERY_RERANK     a co-tenant /v1/rerank endpoint (optional)
+  BATTERY_EMBED      a co-tenant /v1/embeddings endpoint (optional)
+  BATTERY_EMBED_MODEL the embedder's model name (optional)
+
+Exit codes: 0 PASS, 1 FAIL, 2 USAGE.
+"""
+
 
 def _validate(url: str) -> str:
     parts = urllib.parse.urlparse(url)
     if parts.scheme not in ("http", "https") or parts.hostname not in ALLOWED_HOSTS:
         raise SystemExit(f"refusing non-local URL: {url} (extend ALLOWED_HOSTS for your own endpoints)")
     return url
+
+
+if "-h" in sys.argv or "--help" in sys.argv:
+    # Answer usage and exit WITHOUT running the battery: the old version
+    # treated --help as an argument and ran the whole acceptance gate.
+    print(USAGE)
+    raise SystemExit(EXIT_PASS)
 
 
 LANE = _validate(os.environ.get("BATTERY_LANE", "http://127.0.0.1:8000")) + "/v1/chat/completions"
@@ -106,7 +150,7 @@ interactive_rates, chat_rates, vision_ok, errors = [], [], [], []
 lock = threading.Lock()
 
 def interactive(i):
-    for r in range(4):
+    for r in range(INTERACTIVE_ROUNDS):
         try:
             rate, _ = gen_stream(f"Editing task {i}-{r}: refactor this loop to use itertools and explain the change in one paragraph. The loop iterates rows and accumulates totals for report {r}.", 256)
             with lock: interactive_rates.append(rate)
@@ -114,7 +158,7 @@ def interactive(i):
             with lock: errors.append(f"interactive {i}-{r}: {e}")
 
 def chat(i):
-    for r in range(6):
+    for r in range(CHAT_ROUNDS):
         try:
             rate, _ = gen_stream(f"Chat message {i}-{r}: what are three quick tips for keeping houseplants alive?", 96)
             with lock: chat_rates.append(rate)
@@ -122,7 +166,7 @@ def chat(i):
             with lock: errors.append(f"chat {i}-{r}: {e}")
 
 def vision(i):
-    for r in range(3):
+    for r in range(VISION_ROUNDS):
         try:
             d = post(LANE, {"model": MODEL, "temperature": 0.0, "max_tokens": 120,
                 "chat_template_kwargs": {"thinking": False},
@@ -150,9 +194,9 @@ def mem_sampler():
         time.sleep(2)
 
 m = threading.Thread(target=mem_sampler); m.start()
-threads = [threading.Thread(target=interactive, args=(i,)) for i in range(2)] + \
-          [threading.Thread(target=chat, args=(i,)) for i in range(8)] + \
-          [threading.Thread(target=vision, args=(i,)) for i in range(2)]
+threads = [threading.Thread(target=interactive, args=(i,)) for i in range(INTERACTIVE_WORKERS)] + \
+          [threading.Thread(target=chat, args=(i,)) for i in range(CHAT_WORKERS)] + \
+          [threading.Thread(target=vision, args=(i,)) for i in range(VISION_WORKERS)]
 t0 = time.time()
 for t in threads: t.start()
 
@@ -204,12 +248,12 @@ _imin, _imean = _stats(interactive_rates)
 _cmean = statistics.mean(chat_rates) if chat_rates else float("nan")
 
 results = [
-    ("interactive-floor", bool(interactive_rates) and all(r >= INTERACTIVE_FLOOR for r in interactive_rates) and len(interactive_rates) == 8,
-     f"samples={len(interactive_rates)} min={_imin:.1f} mean={_imean:.1f} (floor {INTERACTIVE_FLOOR})"),
-    ("chat-healthy", len(chat_rates) == 48 and statistics.mean(chat_rates) >= 3.0,
-     f"samples={len(chat_rates)} mean={_cmean:.1f}"),
-    ("vision-in-flight", len(vision_ok) == 6 and all(vision_ok),
-     f"samples={len(vision_ok)} correct={sum(vision_ok)} (image answers must name both colors)"),
+    ("interactive-floor", bool(interactive_rates) and all(r >= INTERACTIVE_FLOOR for r in interactive_rates) and len(interactive_rates) == INTERACTIVE_SAMPLES,
+     f"samples={len(interactive_rates)}/{INTERACTIVE_SAMPLES} min={_imin:.1f} mean={_imean:.1f} (floor {INTERACTIVE_FLOOR})"),
+    ("chat-healthy", len(chat_rates) == CHAT_SAMPLES and statistics.mean(chat_rates) >= 3.0,
+     f"samples={len(chat_rates)}/{CHAT_SAMPLES} mean={_cmean:.1f}"),
+    ("vision-in-flight", len(vision_ok) == VISION_SAMPLES and all(vision_ok),
+     f"samples={len(vision_ok)}/{VISION_SAMPLES} correct={sum(vision_ok)} (image answers must name both colors)"),
     ("reranker-in-flight", rr_ok or rr_skipped,
      "3 calls ranked correctly" if not rr_skipped else "skipped (BATTERY_RERANK unset — diagnostic run, not the full gate)"),
     ("embed-in-flight", em_ok or em_skipped,

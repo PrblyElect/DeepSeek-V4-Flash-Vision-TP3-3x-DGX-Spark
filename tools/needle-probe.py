@@ -43,6 +43,13 @@ shipped before a selftest existed.
 
 Only talks to the endpoint you point it at (default loopback); redirects
 refused. Extend ALLOWED_HOSTS if you probe a remote head node.
+
+Exit codes:
+    0  PASS  every checked leg held (an instructed needle was recalled, the
+             8-image fence named all eight left-colours in order)
+    1  FAIL  a needle was missed, the vision fence was short or out of
+             order, or a request failed
+    2  USAGE bad arguments
 """
 from __future__ import annotations
 
@@ -173,6 +180,8 @@ def main() -> int:
         print("SELFTEST:", "PASS" if ok else "FAIL")
         return 0 if ok else 1
 
+    failures: list[str] = []
+
     if not args.skip_needle:
         print(f"== context ladder ({'INSTRUCTED' if instruct else 'UNINSTRUCTED/legacy — not a recall gate'}) ==")
         for depth in [int(x) for x in args.depths.split(",")]:
@@ -189,8 +198,18 @@ def main() -> int:
                 rate = int(pt / wall) if wall else 0
                 print(f"  {'PASS' if ok else 'FAIL'} ~{depth // 1024}K: prompt_tokens={pt} "
                       f"prefill~{rate} tok/s wall={wall:.0f}s word={'found' if ok else 'MISSING'}")
+                if not ok:
+                    if instruct:
+                        failures.append(f"~{depth // 1024}K: the needle word was not recalled")
+                    else:
+                        # --legacy is a historical reproduction, not a recall
+                        # gate: it measures continuation style, so a miss is
+                        # a reading, not a failure.
+                        print("       (legacy uninstructed corpus — a miss here is "
+                              "a reading, not a failure)")
             except Exception as exc:  # noqa: BLE001
                 print(f"  FAIL ~{depth // 1024}K: {str(exc)[:90]}")
+                failures.append(f"~{depth // 1024}K: the request failed — {str(exc)[:90]}")
 
     if not args.skip_vision:
         print("== vision fence ==")
@@ -207,6 +226,7 @@ def main() -> int:
             print(f"  image-TTFT: {time.time() - t0:.1f}s (prompt_tokens={pt}) answer={txt.strip()[:40]!r}")
         except Exception as exc:  # noqa: BLE001
             print(f"  image-TTFT FAIL: {str(exc)[:90]}")
+            failures.append(f"the single-image request failed — {str(exc)[:90]}")
         try:
             content = [{"type": "text", "text": "Eight images follow. List the LEFT color of each in order, comma-separated, colors only."}]
             for c in colors:
@@ -214,10 +234,28 @@ def main() -> int:
             txt, pt, wall = chat(lane, args.model, content, max_tokens=80)
             low = txt.lower()
             hits = sum(1 for c in colors if c in low)
-            print(f"  8-image default cap: {hits}/8 left-colors named in order "
+            # The fence is "named IN ORDER", so presence alone is not enough:
+            # the first mention of each colour has to come in the image order.
+            positions = [low.find(c) for c in colors]
+            in_order = all(p >= 0 for p in positions) and positions == sorted(positions)
+            print(f"  8-image default cap: {hits}/8 left-colors named"
+                  f"{' in order' if in_order else ' (OUT OF ORDER)'} "
                   f"(prompt_tokens={pt}, wall={wall:.0f}s) -> {txt.strip()[:80]!r}")
+            if hits != len(colors):
+                failures.append(f"the 8-image fence named {hits}/8 left-colours")
+            elif not in_order:
+                failures.append("the 8-image fence named the colours out of order")
         except Exception as exc:  # noqa: BLE001
             print(f"  8-image default cap FAIL: {str(exc)[:90]}")
+            failures.append(f"the 8-image request failed — {str(exc)[:90]}")
+
+    print()
+    if failures:
+        print("NEEDLE PROBE FAIL:")
+        for msg in failures:
+            print(f"  - {msg}")
+        return 1
+    print("NEEDLE PROBE PASS — every checked leg held.")
     return 0
 
 

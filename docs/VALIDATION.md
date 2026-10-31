@@ -151,7 +151,8 @@ explicit instruction; score word-exact; and judge an echo-able word.
 ```sh
 python3 tools/needle-probe.py --depths 131072,196608,262144 --nonce fresh1
 # expected: PASS on every depth — read the reported prompt_tokens, not the
-# depth estimate: filler token estimates run low
+# depth estimate: filler token estimates run low. The tool exits non-zero
+# if any depth misses the needle (NEEDLE PROBE FAIL).
 ```
 
 ### 2.5 The vision fence
@@ -162,7 +163,8 @@ with every image's colour named in order at TP=3.
 ```sh
 python3 tools/needle-probe.py --depths 1024 --skip-needle
 # expected: PASS — 8/8 images named in order; the cap is the engine's
-# --limit-mm-per-prompt flag, not the model
+# --limit-mm-per-prompt flag, not the model. The tool exits non-zero if a
+# colour is missing OR the eight are named out of order.
 ```
 
 ### 2.6 The aggregate sweep
@@ -173,7 +175,9 @@ beside the speed run.
 
 ```sh
 python3 tools/agg-sweep.py --levels 1,4,16,32
-# expected: PASS in both prompt classes, and the corruption spot-check green
+# expected: — AGG SWEEP CLEAN, and the corruption spot-check green
+# (exact_repeat=True strict_json=True). The spot-check is part of the
+# verdict: if either half fails, the tool prints WITH ERRORS and exits 1.
 ```
 
 ### 2.7 The mixed-tax probe
@@ -185,7 +189,10 @@ multi-second gaps means the deferral knob is off or was not applied.
 MIXED_TAX_LANE=http://127.0.0.1:8000 MIXED_TAX_MODEL=ds4flash-vision \
   python3 tools/mixed-tax-probe.py
 # expected: the mixed tax stays in the ~3x mean class with the median at
-# solo speed and the worst gap in the ~1 s class
+# solo speed and the worst gap in the ~1 s class. The probe GATES those
+# bounds: MIXED-TAX PROBE PASS, or a non-zero exit naming the bound that
+# was crossed (mean >8x solo, p50 >6x solo, or a worst gap >5 s). The
+# knob-off state measures ~12x with multi-second gaps.
 ```
 
 ### 2.8 The admission probe
@@ -200,7 +207,9 @@ run it on the head box — and note that its first argument is the endpoint
 ```sh
 python3 tools/fairness-probe.py http://127.0.0.1:8000/v1 admission 262144 ds4flash-vision
 # expected: the mid-bulk chat answers in the single-digit-seconds class and
-# both needles stay word-exact through preempt-recompute-resume
+# both needles stay word-exact through preempt-recompute-resume. The probe
+# GATES that: FAIRNESS PROBE PASS, or a non-zero exit naming the lost
+# needle or the blown bound (chat wall >60 s, worst decode gap >30 s).
 ```
 
 ### 2.9 The mixed battery — the acceptance gate
@@ -222,6 +231,10 @@ python3 tools/mixed-battery.py
 # the co-tenant legs green. The battery also PRINTS the lowest MemAvailable
 # it saw during the run: that figure is reported, not gated, because no
 # floor is defined for it.
+# The sample counts are derived from the battery's own loop constants:
+# 8 interactive samples (2 workers x 4 rounds), 48 chat samples
+# (8 workers x 6 rounds), 6 vision samples (2 workers x 3 rounds). A short
+# count fails the gate — a missing sample is not a pass.
 ```
 
 ### 2.10 The warm-prefix replay
@@ -230,15 +243,32 @@ One stable prefix, cold call versus an immediate second call from the same
 client. The second call's time-to-first-token ratio is the replay win.
 Replay once, after the warmup settles — never on a schedule.
 
+`tools/prefix-replay.py` is the gate. It sends the same payload twice,
+checks that BOTH calls answered 200 with content, and reports the
+warm/cold time-to-first-token ratio. (A `curl -s ... >/dev/null` loop
+cannot do this: it exits 0 on a 500, so it would report a healthy replay
+for an engine that answered every call with an error.)
+
 ```sh
-# Supply your own captured prefixes as prefixes/*.json — this recipe ships
-# the REFERENCE implementation of the capture, not the payloads themselves.
-for f in prefixes/*.json; do
-  curl -s http://127.0.0.1:8000/v1/chat/completions \
-    -H 'Content-Type: application/json' -d @"$f" >/dev/null
-done
-# expected: every replay answers 200; the second call is the fast one
+python3 tools/prefix-replay.py --lane http://127.0.0.1:8000 \
+  --model ds4flash-vision
+# expected: PREFIX REPLAY PASS — every replay answered 200 with content,
+# and the warm call did not regress
+
+# to replay YOUR OWN captured prefixes instead of the synthesised one,
+# pass one chat-completions request body per file:
+python3 tools/prefix-replay.py --lane http://127.0.0.1:8000 \
+  --model ds4flash-vision --payload prefixes/client-a.json
+# expected: one cold/warm pair per payload
+
+# to gate the WIN itself (not just success), add --require-speedup — use
+# it only when the prefix is known to be long enough to be cached:
+python3 tools/prefix-replay.py --lane http://127.0.0.1:8000 \
+  --model ds4flash-vision --require-speedup
 ```
+
+This recipe ships the gate and a synthesised prefix — it ships no client
+payloads. The reader supplies their own with `--payload`.
 
 ### 2.11 The spec-decode short-prompt shape
 

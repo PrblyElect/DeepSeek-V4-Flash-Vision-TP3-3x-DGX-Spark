@@ -46,7 +46,8 @@ Usage:
         --container ds4flash-vision-head
 
 Exit codes: 0 = the short-prompt path answered sanely, 1 = it did not,
-2 = the probe could not be set up (that is a setup error, not a verdict).
+2 = the probe could not be set up (that is a setup error, not a verdict),
+3 = the command line was wrong (usage error).
 """
 
 from __future__ import annotations

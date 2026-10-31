@@ -121,6 +121,15 @@
         "DSPARK_INTERACTIVE_MAX_PROMPT_TOKENS": "read by patches/apply_interactive_admission.py",
         "DSPARK_BULK_PRIORITY": "read by patches/apply_interactive_admission.py",
         "DSPARK_BULK_YIELD_LIMIT": "read by patches/apply_interactive_admission.py"
+      },
+      "owner": {
+        "DSV4V_PREFILL_SP_STAGES": "patches/apply_sp_prefill.py",
+        "DSV4V_PREFILL_SP_MIN_ROWS": "patches/apply_sp_prefill.py",
+        "DSPARK_PREFILL_DECODE_INTERVAL": "patches/apply_prefill_decode_interval.py",
+        "DSPARK_INTERACTIVE_ADMISSION": "patches/apply_interactive_admission.py",
+        "DSPARK_INTERACTIVE_MAX_PROMPT_TOKENS": "patches/apply_interactive_admission.py",
+        "DSPARK_BULK_PRIORITY": "patches/apply_interactive_admission.py",
+        "DSPARK_BULK_YIELD_LIMIT": "patches/apply_interactive_admission.py"
       }
     },
     "reader_library": {

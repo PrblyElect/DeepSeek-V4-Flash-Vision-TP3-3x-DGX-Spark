@@ -55,9 +55,14 @@ in a temporary directory, renames a variable in it, and shows the guard
 rejecting it. A guard that cannot fail is not a guard.
 """
 
+# The `apply_synthetic.py` fixture below is created at runtime in a temporary
+# directory by --selftest; it is not a shipped file.
+# selftest-ignore-ref: apply_synthetic.py
+
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import subprocess
@@ -522,39 +527,81 @@ def recipe_source_chunks(recipe_root: Path, dirs: list[str]) -> list[tuple[str, 
 
 def check_recipe(recipe_root: Path, classes: list[tuple[str, dict]], dirs: list[str],
                  quiet: bool = False) -> Report:
-    """Check the variables this recipe's own appliers read."""
+    """Check the variables this recipe's own appliers read.
+
+    A recipe-owned variable is read by ONE declared owner file (the manifest
+    names it). The check therefore asks "does THAT file still read it?", not
+    "does the name appear anywhere in the tree?": a sibling applier, a probe's
+    docstring or a comment that happens to mention the knob is not a reader.
+    A union over every file would keep reporting the variable as present
+    after its applier was deleted, and a check that cannot fail is worse
+    than no check. When the manifest declares no owner for a variable, the
+    union is still used as a fallback.
+    """
     rep = Report()
     emit(quiet, "[recipe] " + ", ".join(d + "/" for d in dirs))
     chunks = recipe_source_chunks(recipe_root, dirs)
     code_chunks = [(rel, text) for rel, text in chunks if not is_documentation(rel)]
     doc_chunks = [(rel, text) for rel, text in chunks if is_documentation(rel)]
+    code_by_rel = {rel: text for rel, text in code_chunks}
     checked = 0
     missing: list[str] = []
     doc_only: list[str] = []
     for _cname, cdef in classes:
         if cdef.get("carrier") != "recipe":
             continue
+        owners = cdef.get("owner", {}) or {}
         for var in cdef["vars"]:
             checked += 1
             pattern = var_pattern(var)
-            if any(pattern.search(text) for _rel, text in code_chunks):
+            owner = owners.get(var)
+            owner_text = None
+            if owner:
+                owner_text = code_by_rel.get(owner)
+                if owner_text is not None and pattern.search(owner_text):
+                    continue
+            elif any(pattern.search(text) for _rel, text in code_chunks):
+                # No declared owner: fall back to "somewhere in this recipe's
+                # own code", which is the best this check can do.
                 continue
-            if any(pattern.search(text) for _rel, text in doc_chunks):
-                # The name survives only in documentation. That is not an
-                # applier reading it -- it is the README lagging behind
-                # the applier that was changed or removed.
+            in_docs = any(pattern.search(text) for _rel, text in doc_chunks)
+            in_other_code = any(
+                pattern.search(text) for rel, text in code_chunks
+                if owner is None or rel != owner
+            )
+            if in_docs:
+                # The name survives in documentation. That is not an applier
+                # reading it -- it is the README lagging behind the applier
+                # that was changed or removed.
                 doc_only.append(var)
+                where = f" (owner: {owner})" if owner else ""
+                gone = (" -- that owner file is missing from the tree"
+                        if owner and owner_text is None else "")
+                also = (" — and in files that do not own it"
+                        if in_other_code else "")
                 rep.fail(
                     f"[recipe] {var} appears only in documentation in this recipe's own "
                     "sources — the applier that owned it was changed or removed, and "
-                    "the README still names it"
+                    f"the README still names it{where}{gone}{also}"
                 )
                 continue
             missing.append(var)
-            rep.fail(
-                f"[recipe] {var} is no longer read by this recipe's own sources — "
-                "the applier that owned it was changed or removed"
-            )
+            if owner and owner_text is None:
+                rep.fail(
+                    f"[recipe] {var} is no longer read by this recipe's own sources — "
+                    f"its owner file {owner} is missing from the tree"
+                )
+            elif owner:
+                rep.fail(
+                    f"[recipe] {var} is no longer read by this recipe's own sources — "
+                    f"its owner {owner} does not read it (another file naming it does "
+                    "not count as a reader)"
+                )
+            else:
+                rep.fail(
+                    f"[recipe] {var} is no longer read by this recipe's own sources — "
+                    "the applier that owned it was changed or removed"
+                )
     for var in doc_only:
         emit(quiet, f"    DOC-ONLY VAR {var}")
     for var in missing:
@@ -720,6 +767,16 @@ def selftest(manifest: dict) -> int:
         )
         (root / "tools").mkdir(parents=True, exist_ok=True)
 
+        # The synthetic tree has one applier, so the manifest's real per-variable
+        # owners are remapped onto it. The owner binding itself is exercised
+        # below, against a sibling file that is NOT the owner.
+        synth_manifest = copy.deepcopy(manifest)
+        synth_manifest["classes"]["recipe_owned"]["owner"] = {
+            n: "patches/apply_synthetic.py" for n in recipe_names
+        }
+        classes = list(synth_manifest["classes"].items())
+        keys = upstream_keys(synth_manifest)
+
         profile_vars: list[str] = []
         for _cname, cdef in classes:
             for var in cdef["vars"]:
@@ -729,10 +786,10 @@ def selftest(manifest: dict) -> int:
         def sources_now() -> dict[str, Source]:
             return {
                 u["key"]: LocalCheckout(u["key"], trees[u["key"]], u.get("search_files", []))
-                for u in manifest["upstreams"]
+                for u in synth_manifest["upstreams"]
             }
 
-        rep = run(manifest, profile_vars, sources_now(), root, quiet=True)
+        rep = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
         passed = not rep.failures
         print(f"  {'PASS' if passed else 'FAIL'} selftest: an intact synthetic upstream passes")
         for msg in rep.failures:
@@ -741,10 +798,10 @@ def selftest(manifest: dict) -> int:
 
         # 3. rename one variable in the first upstream tree — the guard must FAIL
         victim = "MAX_NUM_SEQS"
-        first = manifest["upstreams"][0]
+        first = synth_manifest["upstreams"][0]
         synthetic[first["key"]][victim + "_RENAMED"] = synthetic[first["key"]].pop(victim)
         write_synthetic(trees[first["key"]], first, synthetic[first["key"]])
-        rep2 = run(manifest, profile_vars, sources_now(), root, quiet=True)
+        rep2 = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
         detected = any(victim in m and "no longer appears" in m for m in rep2.failures)
         print(f"  {'PASS' if detected else 'FAIL'} selftest: renaming {victim} upstream is detected "
               f"({len(rep2.failures)} failure(s) reported)")
@@ -758,18 +815,89 @@ def selftest(manifest: dict) -> int:
         synthetic[first["key"]][victim] = "1"
         write_synthetic(trees[first["key"]], first, synthetic[first["key"]])
 
+        # 3. a recipe-owned variable that survives only in DOCUMENTATION is
+        #    a FAILURE, not a presence. A README that still names a variable
+        #    its applier no longer reads is exactly the drift this guard
+        #    exists to catch -- and a search that unions every file's text
+        #    would have called it present. This case is the one that proves
+        #    the recipe half does not do that.
+        if recipe_names:
+            readme = root / "patches" / "README.md"
+            readme.parent.mkdir(parents=True, exist_ok=True)
+            readme.write_text(
+                "# synthetic documentation\n"
+                + "\n".join(f"# {n} is configured here" for n in recipe_names) + "\n"
+            )
+            applier.unlink()
+            rep_doc = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
+            doc_detected = any(
+                "appears only in documentation" in m for m in rep_doc.failures
+            )
+            print(f"  {'PASS' if doc_detected else 'FAIL'} selftest: a recipe-owned variable "
+                  f"that survives only in documentation is a failure, not a presence "
+                  f"({len(rep_doc.failures)} failure(s) reported)")
+            if doc_detected:
+                for msg in rep_doc.failures:
+                    if "appears only in documentation" in msg:
+                        print(f"        {msg}")
+            else:
+                print("        the guard called a documentation-only variable present — "
+                      "a union search would have passed it")
+            ok = ok and doc_detected
+            # restore the tree for the remaining cases
+            applier.parent.mkdir(parents=True, exist_ok=True)
+            applier.write_text(
+                "# synthetic applier\n"
+                + "\n".join(f"os.environ.get('{n}')" for n in recipe_names) + "\n"
+            )
+            readme.unlink()
+
+            # 3b. a recipe-owned variable whose OWNER file is gone, but whose
+            #     name survives in a SIBLING code file, is a FAILURE. The
+            #     sibling is not the owner: a probe's docstring or a comment
+            #     that happens to mention the knob is not a reader. A union
+            #     over every non-doc file would have called it present.
+            sibling = root / "tools" / "sibling_reader.py"
+            sibling.write_text(
+                "# synthetic sibling: mentions the knobs but does not own them\n"
+                + "\n".join(f"# {n}" for n in recipe_names) + "\n"
+            )
+            applier.unlink()
+            rep_sib = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
+            sib_detected = any(
+                "is no longer read by this recipe's own sources" in m
+                for m in rep_sib.failures
+            )
+            print(f"  {'PASS' if sib_detected else 'FAIL'} selftest: a recipe-owned variable "
+                  f"named only in a sibling file is a failure — the owner binding holds "
+                  f"({len(rep_sib.failures)} failure(s) reported)")
+            if sib_detected:
+                for msg in rep_sib.failures:
+                    if "is no longer read by this recipe's own sources" in msg:
+                        print(f"        {msg}")
+            else:
+                print("        the guard called a sibling's mention a reader — "
+                      "a union search would have passed it")
+            ok = ok and sib_detected
+            sibling.unlink()
+            applier.parent.mkdir(parents=True, exist_ok=True)
+            applier.write_text(
+                "# synthetic applier\n"
+                + "\n".join(f"os.environ.get('{n}')" for n in recipe_names) + "\n"
+            )
+
         # 4. a reader/library-level variable is a warning class, never a failure:
         #    it must not change the verdict whether it is present or absent
-        rl_vars = manifest["classes"].get("reader_library", {}).get("vars", [])
+        rl_vars = synth_manifest["classes"].get("reader_library", {}).get("vars", [])
         if rl_vars:
             rl_var = rl_vars[0]
             synthetic[first["key"]][rl_var] = "1"
             write_synthetic(trees[first["key"]], first, synthetic[first["key"]])
-            rep3 = run(manifest, profile_vars, sources_now(), root, quiet=True)
+            rep3 = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
             present_ok = not rep3.failures
             synthetic[first["key"]].pop(rl_var, None)
             write_synthetic(trees[first["key"]], first, synthetic[first["key"]])
-            rep4 = run(manifest, profile_vars, sources_now(), root, quiet=True)
+            rep4 = run(synth_manifest, profile_vars, sources_now(), root, quiet=True)
             absent_ok = not rep4.failures
             clean = present_ok and absent_ok
             print(f"  {'PASS' if clean else 'FAIL'} selftest: a reader/library-level variable "

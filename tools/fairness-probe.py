@@ -37,7 +37,16 @@ usage: fairness-probe.py [ENDPOINT] [LABEL] [BULK_TOKENS] [MODEL]
 
 Only talks to the endpoint you point it at (default loopback); redirects
 refused. Extend ALLOWED_HOSTS if you probe a remote head node.
+
+Exit codes:
+    0  PASS  the idle gate held, both needles were found, and the chat
+             mid-bulk wall and the worst decode gap stayed inside their
+             bounds
+    1  FAIL  a needle was lost, the chat wall or the decode gap blew past
+             its bound, or the engine was not idle
+    2  USAGE bad arguments
 """
+import argparse
 import json
 import random
 import re
@@ -48,6 +57,17 @@ import urllib.parse
 import urllib.request
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+
+# Set from the parsed arguments in main(); the helpers below read them.
+EP = "http://127.0.0.1:8000/v1"
+LABEL = "run"
+BULK_TOKENS = 200000
+MODEL = "ds4flash-vision"
+RESULTS = {}
 
 def validate(url: str) -> str:
     parts = urllib.parse.urlsplit(url)
@@ -60,14 +80,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(newurl, code, "redirect refused", headers, fp)
 
 _opener = urllib.request.build_opener(_NoRedirect)
-
-_SELFTEST = "--selftest" in sys.argv[1:]
-_args = [a for a in sys.argv[1:] if a != "--selftest"]
-EP = validate(_args[0] if _args else "http://127.0.0.1:8000/v1")
-LABEL = _args[1] if len(_args) > 1 else "run"
-BULK_TOKENS = int(_args[2]) if len(_args) > 2 else 200000
-MODEL = _args[3] if len(_args) > 3 else "ds4flash-vision"
-RESULTS = {}
 
 WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
          "lima mike november oscar papa quebec romeo sierra tango uniform "
@@ -141,12 +153,21 @@ def bulk_corpus(idx):
 def selftest():
     corpus, codeword = bulk_corpus(0)
     text = corpus[1]["content"]
-    assert codeword in text and text.count(f"the magic passport is {codeword}") == 1, \
-        "codeword must appear exactly once"
+    # Explicit checks, not `assert`: `python3 -O` strips asserts, and a
+    # self-test that disappears under an optimisation flag is not a test.
+    problems = []
+    if not (codeword in text and text.count(f"the magic passport is {codeword}") == 1):
+        problems.append("codeword must appear exactly once")
     first_sent = text.split(".")[0]
-    assert "ZQ" in first_sent and codeword not in first_sent, \
-        "nonce belongs at corpus position ~1, the codeword at depth"
-    assert len(codeword.split("-")[-1]) <= 2, "judged tail stays echo-able"
+    if not ("ZQ" in first_sent and codeword not in first_sent):
+        problems.append("nonce belongs at corpus position ~1, the codeword at depth")
+    if len(codeword.split("-")[-1]) > 2:
+        problems.append("judged tail stays echo-able")
+    if problems:
+        print("selftest FAILED:")
+        for p in problems:
+            print(f"  - {p}")
+        raise SystemExit(1)
     print("selftest OK: nonce at position ~1, one codeword at ~72% depth, "
           f"judged token {codeword!r}")
     raise SystemExit(0)
@@ -168,9 +189,51 @@ def idle_gate():
     return False
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="fairness-probe.py",
+        description="Measure the admission-fairness axis: what an interactive "
+                    "request experiences while deep prefills hold the engine.",
+        epilog="positional: ENDPOINT LABEL BULK_TOKENS MODEL "
+               "(e.g. fairness-probe.py http://127.0.0.1:8000/v1 admission 200000)",
+    )
+    ap.add_argument("endpoint", nargs="?", default="http://127.0.0.1:8000/v1",
+                    help="the engine's /v1 base URL (default: http://127.0.0.1:8000/v1)")
+    ap.add_argument("label", nargs="?", default="run", help="a label for the run")
+    ap.add_argument("bulk_tokens", nargs="?", type=int, default=200000,
+                    help="the bulk corpus size in tokens")
+    ap.add_argument("model", nargs="?", default="ds4flash-vision",
+                    help="the served model name")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the corpus construction offline, then exit")
+    ap.add_argument("--max-chat-wall", type=float, default=60.0,
+                    help="fail if the mid-bulk chat wall exceeds this many seconds "
+                         "(default: 60 — a minutes-class wall means admission is broken)")
+    ap.add_argument("--max-decode-gap", type=float, default=30.0,
+                    help="fail if the worst inter-token gap exceeds this many seconds "
+                         "(default: 30)")
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
+    args = ap.parse_args()
+
+    global EP, LABEL, BULK_TOKENS, MODEL
+    try:
+        EP = validate(args.endpoint)
+    except SystemExit as exc:
+        print(f"usage error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    LABEL = args.label
+    BULK_TOKENS = args.bulk_tokens
+    MODEL = args.model
+
     print(f"[{LABEL}] idle gate...", flush=True)
-    assert idle_gate(), "engine not idle — aborting (idle-gate rule, docs/VALIDATION.md §2)"
+    if not idle_gate():
+        print("FAIL: engine not idle — aborting (idle-gate rule, "
+              "docs/VALIDATION.md §2)", file=sys.stderr)
+        return EXIT_FAIL
     ttfts = []
     for i in range(3):
         dt, _ = chat([{"role": "user", "content": f"Say the word 'ready' and nothing else. ({i})"}], 8)
@@ -224,8 +287,40 @@ def main():
           f"needles={'/'.join('OK' if b['found'] else 'MISS' for b in bulks)} "
           f"bulk_walls={[round(b['wall_s'], 1) for b in bulks]}", flush=True)
 
+    # ---- the verdict ----
+    # The probe used to print a summary and exit 0 whatever it found, so a
+    # lost needle or a minutes-class chat wall still read as a clean run.
+    # Both are failures here.
+    failures: list[str] = []
+    missing = [b["idx"] for b in bulks if not b["found"]]
+    if missing:
+        failures.append(f"needle lost in bulk {missing} — the codeword did not survive "
+                        "the preemption/resume")
+    wall = RESULTS["chat_midbulk_wall_s"]
+    if wall is None:
+        failures.append("the mid-bulk chat never answered")
+    elif wall > args.max_chat_wall:
+        failures.append(f"mid-bulk chat wall {wall:.1f}s exceeds the "
+                        f"{args.max_chat_wall:.0f}s bound — admission is broken")
+    gap = RESULTS["decode_worst_gap_s"]
+    if gap is None:
+        failures.append("the decode stream produced no gaps to measure")
+    elif gap > args.max_decode_gap:
+        failures.append(f"worst decode gap {gap:.1f}s exceeds the "
+                        f"{args.max_decode_gap:.0f}s bound")
+
+    print()
+    if failures:
+        print("FAIRNESS PROBE FAIL:")
+        for msg in failures:
+            print(f"  - {msg}")
+        return EXIT_FAIL
+    print("FAIRNESS PROBE PASS — needles found, the mid-bulk chat wall and the "
+          "worst decode gap stayed inside their bounds.")
+    return EXIT_PASS
+
 
 if __name__ == "__main__":
-    if _SELFTEST:
+    if "--selftest" in sys.argv[1:]:
         selftest()
-    main()
+    sys.exit(main())

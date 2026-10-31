@@ -20,7 +20,7 @@ decoding and a ported sequence-parallel prefill path. As far as we can
 find this is the **first TP=3 serving of this checkpoint with the vision
 tower live**. Warm numbers: **~99 tok/s** single-stream on code-class
 streams, **~1K tok/s aggregate at the 32-stream cap**, a **~4.1M-token
-KV pool ≈ 3.8 simultaneous full-1M-context sessions**, instructed-recall
+KV pool ≈ 3.9 simultaneous full-1M-context sessions**, instructed-recall
 verified **word-exact to ~950K tokens**, 8/8 images per request at
 ~0.7 s image-TTFT, and **~14× effective TTFT** on replayed warm prefixes.
 Boot is ~5 min with ~110-class pre-warmed shapes (C=1–32 + sampler combos),
@@ -184,6 +184,7 @@ python3 tools/needle-probe.py --selftest
 python3 tools/needle-probe.py --depths 131072,196608,262144 --nonce fresh1   # ~210K/~320K/~420K instructed ladder
 DSPARK_WARMUP_MAX_CONCURRENCY=32 bash tools/boot-shape-warmup.sh http://127.0.0.1:8000 ds4flash-vision
 python3 tools/agg-sweep.py --levels 1,4,16,32
+python3 tools/prefix-replay.py --lane http://127.0.0.1:8000 --model ds4flash-vision
 BATTERY_LANE=http://127.0.0.1:8000 BATTERY_RERANK=... BATTERY_EMBED=... python3 tools/mixed-battery.py
 ```
 
@@ -219,19 +220,21 @@ co-tenant services. At the shipped gmu the boxes hold
 ~4–9 GiB steady with the lane serving, and a several-GiB floor holds
 through a mixed battery with the co-tenant services **live** (the
 acceptance gate's full form runs them in flight — a tenants-skipped run
-is a diagnostic, not a gate). **gmu 0.78 is the shipped value on a
-unified-memory box:** the GPU reservation and request-side CPU staging
-draw from one pot, so a single very deep prefill (a ~30k tok/s prompt
-burst) can stage ~5 GiB of CPU working set and starve the box while the
-KV pool still reports free capacity — the 0.80 margin was too thin for
-that class (recurring kernel-OOM events, each with a different trigger
-and the same constant: headroom, not trigger; see landmine 15). 0.78
-restores a measured floor (a 2×~420K needle battery held a ~6 GiB trough
-with zero OOM) and keeps the pool at ~4.0M. **Rule: no GPU-side tenants
-on a serving box at 0.80 — TP3 means every box carries a rank, so
-there is no free box to disperse a tenant to; drop to 0.78 if one is
-live.** Spend the headroom deliberately; every gmu step in the FIXLOG
-records what it buys.
+is a diagnostic, not a gate). **gmu 0.80 is the shipped value, and it
+assumes no GPU-side tenant on a serving box:** the GPU reservation and
+request-side CPU staging draw from one pot on a unified-memory box, so a
+single very deep prefill (a ~30k tok/s prompt burst) can stage ~5 GiB of
+CPU working set and starve the box while the KV pool still reports free
+capacity — that class produced recurring kernel-OOM events, each with a
+different trigger and the same constant: headroom, not trigger (see
+landmine 15). At the tenant-free posture 0.80 is certified: the same
+2×~420K needle battery that once needed 0.78 now holds 9.0–10.8 GiB
+floors, and a ~742K full-context recall held 8.7+ GiB. **Rule: if a
+GPU-side tenant is live on a serving box, drop to 0.78** — TP3 means
+every box carries a rank, so there is no free box to disperse a tenant
+to; 0.78 is the certified tenant-side posture (a 2×~420K battery held a
+~6 GiB trough with zero OOM) and keeps the pool at ~4.0M. Spend the
+headroom deliberately; every gmu step in the FIXLOG records what it buys.
 
 ### Not tested / not claimed
 
@@ -361,15 +364,15 @@ Around that close, the posture hardened on three more axes:
   traffic always outranks it (`DSPARK_BOOT_PREFIX_WARM` is the knob
   this profile reserves for it; the pinned upstream launcher ships
   none — with no gate wired, the key is simply unread). The on-demand
-  loop below is the reference implementation, run with the idle-gate
+  tool below is the reference implementation, run with the idle-gate
   discipline in mind:
 
 ```sh
-# on demand — re-POST each client's stable prefix once, watched:
-for f in prefixes/*.json; do
-  curl -s http://127.0.0.1:8000/v1/chat/completions \
-    -H 'Content-Type: application/json' -d @"$f" >/dev/null
-done
+# on demand — replay each client's stable prefix once, watched:
+python3 tools/prefix-replay.py --lane http://127.0.0.1:8000 \
+  --model ds4flash-vision --payload prefixes/client-a.json
+# expected: PREFIX REPLAY PASS — both calls answered 200 with content,
+# and the warm call did not regress
 ```
 
 One belt beyond the boxes: if clients sit behind a streaming proxy,
@@ -514,7 +517,7 @@ records what each rule cost to learn.
   checkpoint doesn't need.
 
 Net: three boxes buy **native vision at TP=3 with 32-way aggregate
-headroom, ~3.8 full-1M sessions, and verified ~950K recall**. Prefill
+headroom, ~3.9 full-1M sessions, and verified ~950K recall**. Prefill
 remains the frontier — nobody's 3-box V4.0 prefill matches the best
 patched V4.1 lanes, and neither does ours.
 
@@ -526,7 +529,13 @@ patched V4.1 lanes, and neither does ours.
 - Full CX-7 triangle: three QSFP cables, one /24 per leg, RoCEv2, GID
   index 3, MTU 9000; management LAN for bootstrap; NCCL pinned to both
   on-board HCAs per rank, cross-NIC
-- 8 NCCL channels (the measured 3-rank interior optimum)
+- 8 NCCL channels (the measured 3-rank interior optimum) — a **reader-level
+  knob**: the pinned compose upstream does not carry `NCCL_MAX_NCHANNELS`
+  (it is absent from that upstream's environment block, its main branch and
+  its history), so it only takes effect if you pass it into the container
+  yourself. The ~+20% aggregate figure was measured WITH an explicit
+  passthrough; without one the variable is unread and the figure does not
+  apply. The coupling guard warns about this rather than failing on it
 - One fabric address per HCA port, always — a duplicate /24 left on two
   ports by a stale profile is a per-boot routing lottery that reads
   clean at the link layer; after any fabric change, audit every box
@@ -594,14 +603,17 @@ Full detail per rung in `docs/FIXLOG.md`.
     deep prefills engage SP only as full ~8K chunks (adaptive chunk ON).
     The engine's stage/split log lines are the engagement proof; the
     mixed-axis alternatives were measured and rejected.
-15. **gmu 0.78 is the shipped value; 0.80 is a co-tenant-only gamble.**
+15. **gmu 0.80 is the shipped value — and it assumes a tenant-free box.**
     On a unified-memory box one deep prefill's CPU staging shares the
     same pot as the GPU reservation — a single ~30k tok/s prompt burst
     can starve a box while the KV pool still reports free capacity
     (recurring kernel-OOM events, each with a different trigger; the
-    constant is headroom, not trigger). The rule: no GPU-side tenants on
-    a serving box at 0.80; at 0.78 a measured 2×~420K battery held a
-    ~6 GiB trough with zero OOM.
+    constant is headroom, not trigger). At the tenant-free posture the
+    rule is satisfied and certified: the same 2×~420K battery that once
+    needed 0.78 now holds 9.0–10.8 GiB floors at 0.80, and 0.82 was
+    attempted and rejected on idle posture alone. If a GPU-side tenant is
+    live on a serving box, drop to 0.78 — that posture held a ~6 GiB
+    trough with zero OOM.
 16. **Boot hygiene**: workers first, head last; fresh `docker run` never
     `restart`; one GPU owner per box; drop caches every rank; a NIC
     stuck slow or a GPU latched below clock is fixed by a cold power
@@ -692,7 +704,9 @@ Full detail per rung in `docs/FIXLOG.md`.
 - `tools/needle-probe.py` — the instructed-recall ladder + vision fence
   + self-test (the correctness instrument)
 - `tools/agg-sweep.py` — aggregate sweep with the workload split +
-  corruption spot-check
+  corruption spot-check (the spot-check is part of the verdict)
+- `tools/prefix-replay.py` — the warm-prefix replay gate (cold vs warm
+  time-to-first-token, with the success checks wired in)
 - `tools/mixed-tax-probe.py` — decode-beside-deep-prefill probe (the
   decode-fairness instrument)
 - `tools/fairness-probe.py` — the admission probe: chat + decode stream
